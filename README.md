@@ -26,13 +26,24 @@ OPENAI_MODEL=gpt-5-mini
 vercel env pull .env.local
 ```
 
-- or explicit access token credentials:
+- or explicit access token credentials (manual mode):
 
 ```bash
 VERCEL_TEAM_ID=team_xxx
 VERCEL_PROJECT_ID=prj_xxx
 VERCEL_TOKEN=vercel_pat_xxx
 ```
+
+In production on Vercel, Sandbox uses OIDC by default. Do not set `VERCEL_TOKEN`
+unless you intentionally want manual credentials mode.
+
+Optional debug flag for OpenAI failures:
+
+```bash
+DEBUG_LLM=1
+```
+
+When enabled, propose-fix logs the OpenAI error payload to runtime logs (without logging your API key).
 
 4. Start the app:
 

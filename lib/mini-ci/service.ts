@@ -46,6 +46,8 @@ const MAX_OUTPUT_CHARS = 12_000;
 const TRACE_SNIPPET_CHARS = 240;
 const MAX_PROPOSE_LOG_CHARS = 20_000;
 const MAX_DIFF_CHARS = 100_000;
+const LLM_MAX_OUTPUT_TOKENS = 1200;
+const MAX_OPENAI_ERROR_CHARS = 20_000;
 
 type SafeCommandInput = {
   step: string;
@@ -78,6 +80,16 @@ type SandboxCredentials = {
   token: string;
 };
 
+export class MiniCiServiceError extends Error {
+  readonly statusCode: number;
+
+  constructor(message: string, statusCode = 500) {
+    super(message);
+    this.name = "MiniCiServiceError";
+    this.statusCode = statusCode;
+  }
+}
+
 function truncate(value: string, maxChars: number): string {
   if (value.length <= maxChars) {
     return value;
@@ -99,26 +111,20 @@ function nowIso(): string {
 }
 
 function getSandboxCredentialsFromEnv(): SandboxCredentials | undefined {
-  const teamId = process.env.VERCEL_TEAM_ID?.trim();
-  const projectId = process.env.VERCEL_PROJECT_ID?.trim();
   const token = process.env.VERCEL_TOKEN?.trim();
-
-  const provided = [teamId, projectId, token].filter(Boolean).length;
-  if (provided === 0) {
+  if (!token) {
     return undefined;
   }
 
-  if (!teamId || !projectId || !token) {
-    const missing = [
-      teamId ? null : "VERCEL_TEAM_ID",
-      projectId ? null : "VERCEL_PROJECT_ID",
-      token ? null : "VERCEL_TOKEN",
-    ]
+  const teamId = process.env.VERCEL_TEAM_ID?.trim();
+  const projectId = process.env.VERCEL_PROJECT_ID?.trim();
+  if (!teamId || !projectId) {
+    const missing = [teamId ? null : "VERCEL_TEAM_ID", projectId ? null : "VERCEL_PROJECT_ID"]
       .filter(Boolean)
       .join(", ");
     throw new Error(
       `Incomplete Vercel Sandbox credentials. Missing: ${missing}. ` +
-        "Set all three env vars or remove them to use Vercel OIDC.",
+        "When using VERCEL_TOKEN, both VERCEL_TEAM_ID and VERCEL_PROJECT_ID are required.",
     );
   }
 
@@ -580,27 +586,158 @@ function serializeFailingLogs(input: unknown): string {
   }
 }
 
+function isResponsesApiModel(model: string): boolean {
+  return model.trim().toLowerCase().startsWith("gpt-5-mini");
+}
+
+async function parseJsonOrTextBody(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return { raw: text };
+  }
+}
+
+function serializeUnknown(input: unknown): string {
+  try {
+    return JSON.stringify(input);
+  } catch {
+    return String(input);
+  }
+}
+
+function serializeOpenAiError(payload: unknown): string {
+  return truncate(serializeUnknown(payload), MAX_OPENAI_ERROR_CHARS);
+}
+
+function extractResponsesText(payload: unknown): string {
+  if (!payload || typeof payload !== "object") {
+    return "";
+  }
+
+  const asRecord = payload as Record<string, unknown>;
+  const outputText = asRecord.output_text;
+  if (typeof outputText === "string" && outputText.trim()) {
+    return outputText;
+  }
+  if (Array.isArray(outputText)) {
+    const joined = outputText.filter((item) => typeof item === "string").join("\n").trim();
+    if (joined) {
+      return joined;
+    }
+  }
+
+  const chunks: string[] = [];
+  const output = asRecord.output;
+  if (Array.isArray(output)) {
+    for (const entry of output) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      const content = (entry as { content?: unknown }).content;
+      if (!Array.isArray(content)) {
+        continue;
+      }
+      for (const item of content) {
+        if (!item || typeof item !== "object") {
+          continue;
+        }
+        const candidate = item as { type?: unknown; text?: unknown };
+        if ((candidate.type === "output_text" || candidate.type === "text") && typeof candidate.text === "string") {
+          chunks.push(candidate.text);
+        }
+      }
+    }
+  }
+
+  return chunks.join("\n").trim();
+}
+
+function extractChatCompletionsText(payload: unknown): string {
+  if (!payload || typeof payload !== "object") {
+    return "";
+  }
+
+  const maybeContent = (payload as { choices?: Array<{ message?: { content?: unknown } }> }).choices?.[0]
+    ?.message?.content;
+
+  if (typeof maybeContent === "string") {
+    return maybeContent;
+  }
+
+  if (Array.isArray(maybeContent)) {
+    return maybeContent
+      .map((part) => {
+        if (part && typeof part === "object" && "text" in part && typeof part.text === "string") {
+          return part.text;
+        }
+        return "";
+      })
+      .join("\n")
+      .trim();
+  }
+
+  return "";
+}
+
+function parseProposalJson(rawText: string): { explanation?: string; diff?: string } {
+  const trimmed = rawText.trim();
+  const candidates = [trimmed];
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as { explanation?: string; diff?: string };
+    } catch {
+      // try next candidate
+    }
+  }
+
+  throw new MiniCiServiceError(
+    `LLM returned invalid JSON. Raw output: ${truncate(trimmed, MAX_OPENAI_ERROR_CHARS)}`,
+    502,
+  );
+}
+
 export async function proposeFix(input: { runId: string; failingLogs?: unknown }): Promise<ProposeFixResponse> {
   const session = requireSession(input.runId);
   const key = process.env.OPENAI_API_KEY;
   if (!key) {
-    throw new Error("OPENAI_API_KEY is missing on the server.");
+    throw new MiniCiServiceError("OPENAI_API_KEY is missing on the server.", 500);
   }
 
   const failedLogs =
     input.failingLogs ?? session.lastCiLogs.filter((log) => log.status === "failed");
   const serializedLogs = serializeFailingLogs(failedLogs);
   if (!serializedLogs || serializedLogs === "[]") {
-    throw new Error("No failing logs were provided for fix proposal.");
+    throw new MiniCiServiceError("No failing logs were provided for fix proposal.", 400);
   }
 
   const model = process.env.OPENAI_MODEL ?? "gpt-5-mini";
+  const useResponsesApi = isResponsesApiModel(model);
+  const endpoint = useResponsesApi
+    ? "https://api.openai.com/v1/responses"
+    : "https://api.openai.com/v1/chat/completions";
+  const toolName = useResponsesApi ? "openai.responses" : "openai.chat.completions";
+  const debugLlm = process.env.DEBUG_LLM === "1";
+
+  const systemPrompt =
+    "You are a CI-fix agent. Output ONLY valid JSON with keys explanation (string) and diff (string). " +
+    "The diff must be a valid unified diff against the repository root.";
+
   const prompt = [
-    "You are a CI-fix agent.",
     "Given repository metadata and failing CI logs, produce a likely minimal patch.",
-    "Return a JSON object with keys: explanation (string), diff (string).",
-    "The diff must be a valid unified diff against repository root.",
-    "Do not include markdown fences.",
+    "Return ONLY JSON and no markdown fences.",
+    "Required JSON keys: explanation (string), diff (string).",
     "If uncertain, still propose the smallest safe patch.",
     "",
     `Framework guess: ${session.frameworkGuess}`,
@@ -612,69 +749,92 @@ export async function proposeFix(input: { runId: string; failingLogs?: unknown }
     serializedLogs,
   ].join("\n");
 
+  const requestBody = useResponsesApi
+    ? {
+        model,
+        input: [
+          {
+            role: "system",
+            content: [{ type: "text", text: systemPrompt }],
+          },
+          {
+            role: "user",
+            content: [{ type: "text", text: prompt }],
+          },
+        ],
+        max_output_tokens: LLM_MAX_OUTPUT_TOKENS,
+      }
+    : {
+        model,
+        max_tokens: LLM_MAX_OUTPUT_TOKENS,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt,
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+      };
+
   const startedAt = Date.now();
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+  const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${key}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model,
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "You output strict JSON with fields explanation and diff. diff is unified patch text.",
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-    }),
+    body: JSON.stringify(requestBody),
   });
 
   const durationMs = Date.now() - startedAt;
   const trace: TraceEvent[] = [];
 
-  const payload = await response.json();
+  const payload = await parseJsonOrTextBody(response);
 
   if (!response.ok) {
+    const openAiError = serializeOpenAiError(payload);
+    if (debugLlm) {
+      console.error("OpenAI propose-fix error payload:", payload);
+    }
+
     trace.push({
       ts: nowIso(),
       step: "propose-fix",
-      tool: "openai.chat.completions",
+      tool: toolName,
       inputSummary: `model=${model}`,
       exitCode: 1,
       stdoutSnippet: "",
-      stderrSnippet: truncate(JSON.stringify(payload), TRACE_SNIPPET_CHARS),
+      stderrSnippet: truncate(openAiError, TRACE_SNIPPET_CHARS),
       durationMs,
     });
-    throw new Error("LLM request failed while proposing fix.");
+
+    throw new MiniCiServiceError(
+      `OpenAI request failed (${response.status} ${response.statusText}): ${openAiError}`,
+      502,
+    );
   }
 
-  const content = payload?.choices?.[0]?.message?.content;
-
-  let explanation = "No explanation was returned.";
-  let diff = "";
-
-  if (typeof content === "string") {
-    try {
-      const parsed = JSON.parse(content) as { explanation?: string; diff?: string };
-      explanation = parsed.explanation?.trim() || explanation;
-      diff = parsed.diff?.trim() || "";
-    } catch {
-      explanation = "The model response was not valid JSON.";
-    }
+  const modelText = useResponsesApi ? extractResponsesText(payload) : extractChatCompletionsText(payload);
+  if (!modelText) {
+    const serializedPayload = serializeOpenAiError(payload);
+    throw new MiniCiServiceError(
+      `LLM returned empty content. Response payload: ${serializedPayload}`,
+      502,
+    );
   }
+
+  const parsed = parseProposalJson(modelText);
+  const explanation = parsed.explanation?.trim() || "No explanation was returned.";
+  const diff = parsed.diff?.trim() || "";
 
   trace.push({
     ts: nowIso(),
     step: "propose-fix",
-    tool: "openai.chat.completions",
+    tool: toolName,
     inputSummary: `model=${model}`,
     exitCode: diff ? 0 : 1,
     stdoutSnippet: truncate(diff, TRACE_SNIPPET_CHARS),
@@ -683,11 +843,11 @@ export async function proposeFix(input: { runId: string; failingLogs?: unknown }
   });
 
   if (!diff) {
-    throw new Error("LLM did not return a diff proposal.");
+    throw new MiniCiServiceError("LLM did not return a diff proposal.", 502);
   }
 
   if (diff.length > MAX_DIFF_CHARS) {
-    throw new Error(`LLM diff exceeded maximum size (${MAX_DIFF_CHARS} chars).`);
+    throw new MiniCiServiceError(`LLM diff exceeded maximum size (${MAX_DIFF_CHARS} chars).`, 502);
   }
 
   return {

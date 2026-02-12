@@ -23,9 +23,19 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
   });
 
-  const payload = await response.json();
+  const payload: unknown = await response.json().catch(() => null);
   if (!response.ok) {
-    throw new Error(payload?.error ?? `Request failed: ${response.status}`);
+    const statusFromPayload =
+      payload && typeof payload === "object" && "statusCode" in payload && typeof payload.statusCode === "number"
+        ? payload.statusCode
+        : response.status;
+
+    const serverMessage =
+      payload && typeof payload === "object" && "error" in payload && typeof payload.error === "string"
+        ? payload.error
+        : "";
+
+    throw new Error(serverMessage ? `[${statusFromPayload}] ${serverMessage}` : `Request failed (${statusFromPayload})`);
   }
 
   return payload as T;
