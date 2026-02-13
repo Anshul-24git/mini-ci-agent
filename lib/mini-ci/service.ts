@@ -825,11 +825,11 @@ export async function proposeFix(input: {
         input: [
           {
             role: "system",
-            content: [{ type: "text", text: systemPrompt }],
+            content: [{ type: "input_text", text: systemPrompt }],
           },
           {
             role: "user",
-            content: [{ type: "text", text: prompt }],
+            content: [{ type: "input_text", text: prompt }],
           },
         ],
         max_output_tokens: LLM_MAX_OUTPUT_TOKENS,
