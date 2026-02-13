@@ -49,7 +49,7 @@ const MAX_PROPOSE_LOG_CHARS = 20_000;
 const MAX_DIFF_CHARS = 100_000;
 const LLM_MAX_OUTPUT_TOKENS = 2200;
 const MAX_OPENAI_ERROR_CHARS = 20_000;
-const MAX_PROPOSE_ATTEMPTS = 2;
+const MAX_PROPOSE_ATTEMPTS = 3;
 
 type SafeCommandInput = {
   step: string;
@@ -868,49 +868,43 @@ function validateUnifiedDiff(diff: string): { ok: boolean; reason?: string } {
   }
 
   const lines = diff.replace(/\r\n/g, "\n").split("\n");
-  let i = 0;
+  let inHunk = false;
 
-  while (i < lines.length) {
-    const line = lines[i];
-    if (!line.startsWith("@@")) {
-      i += 1;
+  const fileMetaPattern =
+    /^(diff --git |index |new file mode |deleted file mode |old mode |new mode |similarity index |rename from |rename to |--- |\+\+\+ |Binary files )/;
+
+  for (const line of lines) {
+    if (!line) {
       continue;
     }
 
-    const match = line.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);
-    if (!match) {
-      return { ok: false, reason: `Malformed hunk header: '${line}'.` };
+    if (fileMetaPattern.test(line)) {
+      inHunk = false;
+      continue;
     }
 
-    const expectedOld = match[1] ? Number.parseInt(match[1], 10) : 1;
-    const expectedNew = match[2] ? Number.parseInt(match[2], 10) : 1;
-    let seenOld = 0;
-    let seenNew = 0;
-
-    i += 1;
-    while (i < lines.length && !lines[i].startsWith("@@") && !lines[i].startsWith("diff --git ")) {
-      const hunkLine = lines[i];
-      if (hunkLine.startsWith("+") && !hunkLine.startsWith("+++")) {
-        seenNew += 1;
-      } else if (hunkLine.startsWith("-") && !hunkLine.startsWith("---")) {
-        seenOld += 1;
-      } else if (hunkLine.startsWith(" ")) {
-        seenOld += 1;
-        seenNew += 1;
-      } else if (hunkLine === "\\ No newline at end of file" || hunkLine === "") {
-        // allowed metadata/blank
-      } else {
-        return { ok: false, reason: `Unexpected line inside hunk: '${hunkLine}'.` };
+    if (line.startsWith("@@")) {
+      const match = line.match(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/);
+      if (!match) {
+        return { ok: false, reason: `Malformed hunk header: '${line}'.` };
       }
-      i += 1;
+      inHunk = true;
+      continue;
     }
 
-    if (seenOld !== expectedOld || seenNew !== expectedNew) {
-      return {
-        ok: false,
-        reason: `Hunk line count mismatch (expected -${expectedOld}/+${expectedNew}, got -${seenOld}/+${seenNew}).`,
-      };
+    if (inHunk) {
+      if (
+        line.startsWith("+") ||
+        line.startsWith("-") ||
+        line.startsWith(" ") ||
+        line === "\\ No newline at end of file"
+      ) {
+        continue;
+      }
+      return { ok: false, reason: `Unexpected line inside hunk: '${line}'.` };
     }
+
+    return { ok: false, reason: `Unexpected line outside diff sections: '${line}'.` };
   }
 
   return { ok: true };
