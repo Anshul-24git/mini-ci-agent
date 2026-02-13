@@ -774,6 +774,38 @@ function parseProposalJson(rawText: string): { explanation?: string; diff?: stri
   );
 }
 
+function normalizeDiffPatch(rawDiff: string): string {
+  let text = rawDiff.replace(/\r\n/g, "\n").trim();
+  if (!text) {
+    return "";
+  }
+
+  const fenced = text.match(/```(?:diff|patch)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    text = fenced[1].trim();
+  }
+
+  const marker = text.match(/(^diff --git .*$|^---\s+\S+.*$)/m);
+  if (marker?.index && marker.index > 0) {
+    text = text.slice(marker.index).trim();
+  }
+
+  return text;
+}
+
+function hasUnifiedDiffStructure(diff: string): boolean {
+  if (!diff) {
+    return false;
+  }
+
+  const hasGitHeader = /^diff --git .+/m.test(diff);
+  const hasFileHeaders = /^---\s+\S+/m.test(diff) && /^\+\+\+\s+\S+/m.test(diff);
+  const hasHunks = /^@@\s+/m.test(diff);
+  const hasModeOnlyChange = /^(new file mode|deleted file mode|Binary files)/m.test(diff);
+
+  return (hasGitHeader || hasFileHeaders) && (hasHunks || hasModeOnlyChange);
+}
+
 export async function proposeFix(input: {
   runId: string;
   failingLogs?: unknown;
@@ -802,12 +834,14 @@ export async function proposeFix(input: {
 
   const systemPrompt =
     "You are a CI-fix agent. Output ONLY valid JSON with keys explanation (string) and diff (string). " +
-    "The diff must be a valid unified diff against the repository root.";
+    "The diff must be a valid unified diff against the repository root, start with 'diff --git', " +
+    "and include hunk lines that begin with '@@'.";
 
   const prompt = [
     "Given repository metadata and failing CI logs, produce a likely minimal patch.",
     "Return ONLY JSON and no markdown fences.",
     "Required JSON keys: explanation (string), diff (string).",
+    "The diff value must be raw unified patch text (not prose) and should begin with 'diff --git'.",
     "If uncertain, still propose the smallest safe patch.",
     "",
     `Framework guess: ${session.frameworkGuess}`,
@@ -899,7 +933,8 @@ export async function proposeFix(input: {
 
   const parsed = parseProposalJson(modelText);
   const explanation = parsed.explanation?.trim() || "No explanation was returned.";
-  const diff = parsed.diff?.trim() || "";
+  const rawDiff = parsed.diff?.trim() || "";
+  const diff = normalizeDiffPatch(rawDiff);
 
   trace.push({
     ts: nowIso(),
@@ -914,6 +949,13 @@ export async function proposeFix(input: {
 
   if (!diff) {
     throw new MiniCiServiceError("LLM did not return a diff proposal.", 502);
+  }
+
+  if (!hasUnifiedDiffStructure(diff)) {
+    throw new MiniCiServiceError(
+      `LLM did not return a valid unified patch. Raw diff snippet: ${truncate(rawDiff, 1500)}`,
+      502,
+    );
   }
 
   if (diff.length > MAX_DIFF_CHARS) {
@@ -934,13 +976,20 @@ export async function applyFix(input: {
   sessionHint?: SessionHint;
 }): Promise<ApplyFixResponse> {
   const session = resolveSession(input.runId, input.sessionHint);
-  const rawDiff = input.diff.trim();
-  if (!rawDiff) {
+  const normalizedDiff = normalizeDiffPatch(input.diff);
+  if (!normalizedDiff) {
     throw new Error("Diff is required.");
   }
 
-  if (rawDiff.length > MAX_DIFF_CHARS) {
+  if (normalizedDiff.length > MAX_DIFF_CHARS) {
     throw new Error(`Diff too large (>${MAX_DIFF_CHARS} chars).`);
+  }
+
+  if (!hasUnifiedDiffStructure(normalizedDiff)) {
+    throw new MiniCiServiceError(
+      "Proposed diff is not a valid unified patch. Please generate a new fix proposal.",
+      400,
+    );
   }
 
   const credentials = getSandboxCredentialsFromEnv();
@@ -956,7 +1005,7 @@ export async function applyFix(input: {
   await sandbox.writeFiles([
     {
       path: patchPath,
-      content: Buffer.from(rawDiff, "utf8"),
+      content: Buffer.from(normalizedDiff, "utf8"),
     },
   ]);
 
@@ -964,12 +1013,39 @@ export async function applyFix(input: {
     ts: nowIso(),
     step: "write-patch",
     tool: "sandbox.writeFiles",
-    inputSummary: `${patchPath} (${rawDiff.length} chars)`,
+    inputSummary: `${patchPath} (${normalizedDiff.length} chars)`,
     exitCode: 0,
     stdoutSnippet: "Patch written to sandbox.",
     stderrSnippet: "",
     durationMs: Date.now() - writeStartedAt,
   });
+
+  const checkPatchResult = await runSafeCommand(sandbox, {
+    step: "check-patch",
+    cmd: "git",
+    args: ["apply", "--check", "--whitespace=fix", patchPath],
+    cwd: session.repoRoot,
+  });
+  trace.push(checkPatchResult.trace);
+
+  if (checkPatchResult.exitCode !== 0) {
+    logs.push({
+      step: "apply_patch",
+      command: checkPatchResult.commandLabel,
+      status: "failed",
+      exitCode: checkPatchResult.exitCode,
+      stdout: checkPatchResult.stdout,
+      stderr: checkPatchResult.stderr,
+      durationMs: checkPatchResult.durationMs,
+    });
+    return {
+      runId: session.runId,
+      passed: false,
+      logs,
+      diff: "",
+      trace,
+    };
+  }
 
   const applyResult = await runSafeCommand(sandbox, {
     step: "apply-patch",

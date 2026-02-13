@@ -1,9 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import type { SessionHint } from "@/lib/mini-ci/contracts";
-import { applyFix } from "@/lib/mini-ci/service";
+import { applyFix, MiniCiServiceError } from "@/lib/mini-ci/service";
 
 export const runtime = "nodejs";
+
+function shortenErrorMessage(input: string, maxChars = 1200): string {
+  const clean = input.replace(/\s+/g, " ").trim();
+  if (clean.length <= maxChars) {
+    return clean;
+  }
+
+  return `${clean.slice(0, maxChars)}...[truncated]`;
+}
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
   try {
@@ -28,7 +37,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     return NextResponse.json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Apply fix failed.";
-    return NextResponse.json({ error: message, trace: [] }, { status: 500 });
+    const statusCode = error instanceof MiniCiServiceError ? error.statusCode : 500;
+    const rawMessage = error instanceof Error ? error.message : "Apply fix failed.";
+    const message = shortenErrorMessage(rawMessage);
+    return NextResponse.json({ error: message, statusCode, trace: [] }, { status: statusCode });
   }
 }
