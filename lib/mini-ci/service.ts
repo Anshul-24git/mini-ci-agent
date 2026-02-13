@@ -860,84 +860,83 @@ function applyStructuredEditsToContent(filePath: string, baseContent: string, ed
 async function buildDiffFromUpdatedFiles(
   sandbox: Sandbox,
   session: RunSession,
+  originalFiles: Map<string, string>,
   updatedFiles: Map<string, string>,
 ): Promise<{ diff: string; trace: TraceEvent[] }> {
   const trace: TraceEvent[] = [];
-  const tempRoot = `${session.repoRoot}/.mini-ci-agent-candidate-${randomUUID()}`;
+  const filePaths = [...updatedFiles.keys()];
 
+  const writeStartedAt = Date.now();
   await sandbox.writeFiles(
-    [...updatedFiles.entries()].map(([filePath, content]) => ({
-      path: `${tempRoot}/${filePath}`,
-      content: Buffer.from(content, "utf8"),
+    filePaths.map((filePath) => ({
+      path: `${session.repoRoot}/${filePath}`,
+      content: Buffer.from(updatedFiles.get(filePath) ?? "", "utf8"),
     })),
   );
-
   trace.push({
     ts: nowIso(),
-    step: "write-structured-candidate-files",
+    step: "write-structured-updated-files",
     tool: "sandbox.writeFiles",
-    inputSummary: `${updatedFiles.size} file(s) under ${tempRoot}`,
+    inputSummary: `${filePaths.length} file(s) updated in repo`,
     exitCode: 0,
-    stdoutSnippet: "Candidate files written for diff generation.",
+    stdoutSnippet: "Structured fallback candidate changes written.",
     stderrSnippet: "",
-    durationMs: 0,
+    durationMs: Date.now() - writeStartedAt,
   });
 
-  const chunks: string[] = [];
-  for (const filePath of updatedFiles.keys()) {
-    const candidatePath = `${tempRoot}/${filePath}`;
+  let diff = "";
+  let diffFailure: Error | null = null;
+
+  try {
     const diffResult = await runSafeCommand(sandbox, {
-      step: `diff-structured-${filePath}`,
+      step: "diff-structured-files",
       cmd: "git",
-      args: [
-        "diff",
-        "--no-index",
-        "--unified=3",
-        "--",
-        filePath,
-        candidatePath,
-      ],
+      args: ["diff", "--unified=3", "--", ...filePaths],
       cwd: session.repoRoot,
       timeoutMs: 30_000,
-      inputSummary: filePath,
+      inputSummary: filePaths.join(", "),
     });
     trace.push(diffResult.trace);
 
-    if (diffResult.exitCode === 1 && diffResult.stdout.trim()) {
-      const normalizedChunk = normalizeNoIndexDiffChunk(diffResult.stdout, filePath);
-      chunks.push(normalizedChunk.trim());
-      continue;
-    }
-    if (diffResult.exitCode === 0) {
-      continue;
+    if (diffResult.exitCode !== 0 && !diffResult.stdout.trim()) {
+      const reason = (diffResult.stderr || diffResult.stdout || "git diff failed").trim();
+      throw new MiniCiServiceError(`Unable to generate diff from structured edits: ${reason}`, 502);
     }
 
-    const reason = (diffResult.stderr || diffResult.stdout || "git diff failed").trim();
-    throw new MiniCiServiceError(`Unable to generate diff for '${filePath}': ${reason}`, 502);
+    diff = diffResult.stdout.trim();
+    if (!diff) {
+      throw new MiniCiServiceError("Structured edits produced no diff output.", 502);
+    }
+  } catch (error) {
+    diffFailure = error instanceof Error ? error : new Error(String(error));
+  } finally {
+    const restoreStartedAt = Date.now();
+    await sandbox.writeFiles(
+      filePaths.map((filePath) => ({
+        path: `${session.repoRoot}/${filePath}`,
+        content: Buffer.from(originalFiles.get(filePath) ?? "", "utf8"),
+      })),
+    );
+    trace.push({
+      ts: nowIso(),
+      step: "restore-structured-updated-files",
+      tool: "sandbox.writeFiles",
+      inputSummary: `${filePaths.length} file(s) restored`,
+      exitCode: 0,
+      stdoutSnippet: "Structured fallback candidate changes reverted.",
+      stderrSnippet: "",
+      durationMs: Date.now() - restoreStartedAt,
+    });
+  }
+
+  if (diffFailure) {
+    throw diffFailure;
   }
 
   return {
-    diff: chunks.join("\n\n").trim(),
+    diff,
     trace,
   };
-}
-
-function normalizeNoIndexDiffChunk(raw: string, filePath: string): string {
-  const lines = raw.replace(/\r\n/g, "\n").split("\n");
-  return lines
-    .map((line) => {
-      if (line.startsWith("diff --git ")) {
-        return `diff --git a/${filePath} b/${filePath}`;
-      }
-      if (line.startsWith("--- ")) {
-        return `--- a/${filePath}`;
-      }
-      if (line.startsWith("+++ ")) {
-        return `+++ b/${filePath}`;
-      }
-      return line;
-    })
-    .join("\n");
 }
 
 async function proposeFixWithStructuredEditsFallback(input: {
@@ -1076,10 +1075,12 @@ async function proposeFixWithStructuredEditsFallback(input: {
   }
 
   const updatedFiles = new Map<string, string>();
+  const originalFiles = new Map<string, string>();
   for (const [filePath, fileEdits] of byFile.entries()) {
     const currentFile = await readFileAtHead(input.sandbox, input.session, filePath);
     trace.push(currentFile.trace);
 
+    originalFiles.set(filePath, currentFile.content);
     const updated = applyStructuredEditsToContent(filePath, currentFile.content, fileEdits);
     if (updated !== currentFile.content) {
       updatedFiles.set(filePath, updated);
@@ -1090,7 +1091,12 @@ async function proposeFixWithStructuredEditsFallback(input: {
     throw new MiniCiServiceError("Structured fallback produced no file changes.", 502);
   }
 
-  const diffResult = await buildDiffFromUpdatedFiles(input.sandbox, input.session, updatedFiles);
+  const diffResult = await buildDiffFromUpdatedFiles(
+    input.sandbox,
+    input.session,
+    originalFiles,
+    updatedFiles,
+  );
   trace.push(...diffResult.trace);
 
   const diff = normalizeDiffPatch(diffResult.diff);
