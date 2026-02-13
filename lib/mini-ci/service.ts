@@ -893,10 +893,6 @@ async function buildDiffFromUpdatedFiles(
         "diff",
         "--no-index",
         "--unified=3",
-        "--label",
-        `a/${filePath}`,
-        "--label",
-        `b/${filePath}`,
         "--",
         filePath,
         candidatePath,
@@ -908,7 +904,8 @@ async function buildDiffFromUpdatedFiles(
     trace.push(diffResult.trace);
 
     if (diffResult.exitCode === 1 && diffResult.stdout.trim()) {
-      chunks.push(diffResult.stdout.trim());
+      const normalizedChunk = normalizeNoIndexDiffChunk(diffResult.stdout, filePath);
+      chunks.push(normalizedChunk.trim());
       continue;
     }
     if (diffResult.exitCode === 0) {
@@ -923,6 +920,24 @@ async function buildDiffFromUpdatedFiles(
     diff: chunks.join("\n\n").trim(),
     trace,
   };
+}
+
+function normalizeNoIndexDiffChunk(raw: string, filePath: string): string {
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  return lines
+    .map((line) => {
+      if (line.startsWith("diff --git ")) {
+        return `diff --git a/${filePath} b/${filePath}`;
+      }
+      if (line.startsWith("--- ")) {
+        return `--- a/${filePath}`;
+      }
+      if (line.startsWith("+++ ")) {
+        return `+++ b/${filePath}`;
+      }
+      return line;
+    })
+    .join("\n");
 }
 
 async function proposeFixWithStructuredEditsFallback(input: {
