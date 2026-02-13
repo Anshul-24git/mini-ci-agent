@@ -916,12 +916,64 @@ function validateUnifiedDiff(diff: string): { ok: boolean; reason?: string } {
   return { ok: true };
 }
 
+async function checkPatchInSandbox(
+  sandbox: Sandbox,
+  session: RunSession,
+  diff: string,
+  attempt: number,
+): Promise<{ ok: boolean; reason: string; trace: TraceEvent[] }> {
+  const trace: TraceEvent[] = [];
+  const patchPath = `${session.repoRoot}/.mini-ci-agent.proposed-${attempt}.patch`;
+  const writeStartedAt = Date.now();
+  await sandbox.writeFiles([
+    {
+      path: patchPath,
+      content: Buffer.from(diff, "utf8"),
+    },
+  ]);
+
+  trace.push({
+    ts: nowIso(),
+    step: `write-proposed-patch-${attempt}`,
+    tool: "sandbox.writeFiles",
+    inputSummary: `${patchPath} (${diff.length} chars)`,
+    exitCode: 0,
+    stdoutSnippet: "Proposed patch written for validation.",
+    stderrSnippet: "",
+    durationMs: Date.now() - writeStartedAt,
+  });
+
+  const checkResult = await runSafeCommand(sandbox, {
+    step: `check-proposed-patch-${attempt}`,
+    cmd: "git",
+    args: ["apply", "--check", "--whitespace=fix", "--recount", patchPath],
+    cwd: session.repoRoot,
+  });
+  trace.push(checkResult.trace);
+
+  const reason =
+    checkResult.exitCode === 0
+      ? ""
+      : (checkResult.stderr || checkResult.stdout || `git apply --check failed with exit code ${checkResult.exitCode}`).trim();
+
+  return {
+    ok: checkResult.exitCode === 0,
+    reason,
+    trace,
+  };
+}
+
 export async function proposeFix(input: {
   runId: string;
   failingLogs?: unknown;
   sessionHint?: SessionHint;
 }): Promise<ProposeFixResponse> {
   const session = resolveSession(input.runId, input.sessionHint);
+  const credentials = getSandboxCredentialsFromEnv();
+  const sandbox = await Sandbox.get({
+    ...(credentials ?? {}),
+    sandboxId: session.sandboxId,
+  });
   const key = process.env.OPENAI_API_KEY;
   if (!key) {
     throw new MiniCiServiceError("OPENAI_API_KEY is missing on the server.", 500);
@@ -1134,6 +1186,19 @@ export async function proposeFix(input: {
       );
     }
 
+    const patchCheck = await checkPatchInSandbox(sandbox, session, diff, attempt);
+    trace.push(...patchCheck.trace);
+    if (!patchCheck.ok) {
+      lastFailure = `Patch failed git apply --check: ${patchCheck.reason}`;
+      if (attempt < MAX_PROPOSE_ATTEMPTS) {
+        continue;
+      }
+      throw new MiniCiServiceError(
+        `Generated patch is not applicable in sandbox: ${patchCheck.reason}`,
+        502,
+      );
+    }
+
     return {
       runId: session.runId,
       explanation,
@@ -1202,7 +1267,7 @@ export async function applyFix(input: {
   const checkPatchResult = await runSafeCommand(sandbox, {
     step: "check-patch",
     cmd: "git",
-    args: ["apply", "--check", "--whitespace=fix", patchPath],
+    args: ["apply", "--check", "--whitespace=fix", "--recount", patchPath],
     cwd: session.repoRoot,
   });
   trace.push(checkPatchResult.trace);
@@ -1229,7 +1294,7 @@ export async function applyFix(input: {
   const applyResult = await runSafeCommand(sandbox, {
     step: "apply-patch",
     cmd: "git",
-    args: ["apply", "--whitespace=fix", patchPath],
+    args: ["apply", "--whitespace=fix", "--recount", patchPath],
     cwd: session.repoRoot,
   });
   trace.push(applyResult.trace);
