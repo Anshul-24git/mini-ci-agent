@@ -80,6 +80,7 @@ type SafeCommandInput = {
   cwd?: string;
   timeoutMs?: number;
   inputSummary?: string;
+  maxOutputChars?: number;
 };
 
 type SafeCommandResult = {
@@ -236,6 +237,7 @@ async function runSafeCommand(sandbox: Sandbox, input: SafeCommandInput): Promis
   const args = input.args ?? [];
   const label = formatCommand(input.cmd, args);
   const timeoutMs = input.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS;
+  const maxOutputChars = input.maxOutputChars ?? MAX_OUTPUT_CHARS;
   const startedAt = Date.now();
   const ts = nowIso();
 
@@ -274,10 +276,10 @@ async function runSafeCommand(sandbox: Sandbox, input: SafeCommandInput): Promis
       ]);
 
       exitCode = 124;
-      stdout = truncate(rawStdout, MAX_OUTPUT_CHARS);
+      stdout = truncate(rawStdout, maxOutputChars);
       stderr = truncate(
         `${rawStderr}\nCommand timed out after ${timeoutMs}ms`.trim(),
-        MAX_OUTPUT_CHARS,
+        maxOutputChars,
       );
     } else {
       exitCode = outcome.finished.exitCode;
@@ -287,12 +289,12 @@ async function runSafeCommand(sandbox: Sandbox, input: SafeCommandInput): Promis
         outcome.finished.stderr().catch(() => ""),
       ]);
 
-      stdout = truncate(rawStdout, MAX_OUTPUT_CHARS);
-      stderr = truncate(rawStderr, MAX_OUTPUT_CHARS);
+      stdout = truncate(rawStdout, maxOutputChars);
+      stderr = truncate(rawStderr, maxOutputChars);
     }
   } catch (error) {
     const message = `Command failed: ${toErrorMessage(error)}`;
-    stderr = truncate(message, MAX_OUTPUT_CHARS);
+    stderr = truncate(message, maxOutputChars);
     exitCode = 1;
   }
 
@@ -895,6 +897,7 @@ async function buildDiffFromUpdatedFiles(
       cwd: session.repoRoot,
       timeoutMs: 30_000,
       inputSummary: filePaths.join(", "),
+      maxOutputChars: MAX_DIFF_CHARS + 5_000,
     });
     trace.push(diffResult.trace);
 
@@ -1360,10 +1363,6 @@ function normalizeDiffPatch(rawDiff: string): string {
     text = text.replace(/\\n/g, "\n");
   }
 
-  if (text.includes('\\"')) {
-    text = text.replace(/\\"/g, '"');
-  }
-
   if (!text.endsWith("\n")) {
     text += "\n";
   }
@@ -1380,8 +1379,18 @@ function hasUnifiedDiffStructure(diff: string): boolean {
   const hasFileHeaders = /^---\s+\S+/m.test(diff) && /^\+\+\+\s+\S+/m.test(diff);
   const hasHunks = /^@@\s+/m.test(diff);
   const hasModeOnlyChange = /^(new file mode|deleted file mode|Binary files)/m.test(diff);
+  const hasDiffBody = hasHunks || hasModeOnlyChange;
 
-  return (hasGitHeader || hasFileHeaders) && (hasHunks || hasModeOnlyChange);
+  if (!hasDiffBody) {
+    return false;
+  }
+
+  // Hunk-based patches must include file headers for git apply.
+  if (hasHunks && !hasFileHeaders) {
+    return false;
+  }
+
+  return hasGitHeader || hasFileHeaders;
 }
 
 function validateUnifiedDiff(diff: string): { ok: boolean; reason?: string } {
@@ -1391,12 +1400,33 @@ function validateUnifiedDiff(diff: string): { ok: boolean; reason?: string } {
 
   const lines = diff.replace(/\r\n/g, "\n").split("\n");
   let inHunk = false;
+  let sawOldHeaderForFile = false;
+  let sawNewHeaderForFile = false;
 
   const fileMetaPattern =
-    /^(diff --git |index |new file mode |deleted file mode |old mode |new mode |similarity index |rename from |rename to |--- |\+\+\+ |Binary files )/;
+    /^(index |new file mode |deleted file mode |old mode |new mode |similarity index |rename from |rename to |Binary files )/;
 
   for (const line of lines) {
     if (!line) {
+      continue;
+    }
+
+    if (line.startsWith("diff --git ")) {
+      inHunk = false;
+      sawOldHeaderForFile = false;
+      sawNewHeaderForFile = false;
+      continue;
+    }
+
+    if (line.startsWith("--- ")) {
+      inHunk = false;
+      sawOldHeaderForFile = true;
+      continue;
+    }
+
+    if (line.startsWith("+++ ")) {
+      inHunk = false;
+      sawNewHeaderForFile = true;
       continue;
     }
 
@@ -1406,6 +1436,9 @@ function validateUnifiedDiff(diff: string): { ok: boolean; reason?: string } {
     }
 
     if (line.startsWith("@@")) {
+      if (!sawOldHeaderForFile || !sawNewHeaderForFile) {
+        return { ok: false, reason: "Hunk found without file headers ('---' and '+++')." };
+      }
       const match = line.match(/^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/);
       if (!match) {
         return { ok: false, reason: `Malformed hunk header: '${line}'.` };
