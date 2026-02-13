@@ -47,9 +47,31 @@ const MAX_OUTPUT_CHARS = 12_000;
 const TRACE_SNIPPET_CHARS = 240;
 const MAX_PROPOSE_LOG_CHARS = 20_000;
 const MAX_DIFF_CHARS = 100_000;
-const LLM_MAX_OUTPUT_TOKENS = 2200;
+const LLM_MAX_OUTPUT_TOKENS = 1800;
 const MAX_OPENAI_ERROR_CHARS = 20_000;
 const MAX_PROPOSE_ATTEMPTS = 3;
+const MAX_CONTEXT_FILES = 3;
+const MAX_CONTEXT_FILE_CHARS = 4_000;
+const MAX_CANDIDATE_PATHS = 12;
+const FILE_EXTENSIONS_FOR_CONTEXT = new Set([
+  "ts",
+  "tsx",
+  "js",
+  "jsx",
+  "mjs",
+  "cjs",
+  "json",
+  "py",
+  "go",
+  "java",
+  "rb",
+  "php",
+  "cs",
+  "rs",
+  "md",
+  "yml",
+  "yaml",
+]);
 
 type SafeCommandInput = {
   step: string;
@@ -653,6 +675,101 @@ function serializeFailingLogs(input: unknown): string {
   }
 }
 
+function normalizeCandidatePath(raw: string): string | null {
+  let value = raw.trim();
+  value = value.replace(/^['"`(<{\[]+/, "").replace(/['"`)>}\],;]+$/, "");
+  value = value.replace(/:\d+(?::\d+)?$/, "");
+  value = value.replace(/^\.\/+/, "");
+
+  if (!value || value.startsWith("/") || value.includes("\\") || value.includes("\0")) {
+    return null;
+  }
+  if (value.split("/").some((segment) => !segment || segment === "..")) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9._/-]+$/.test(value)) {
+    return null;
+  }
+
+  const dot = value.lastIndexOf(".");
+  if (dot <= 0 || dot === value.length - 1) {
+    return null;
+  }
+  const extension = value.slice(dot + 1).toLowerCase();
+  if (!FILE_EXTENSIONS_FOR_CONTEXT.has(extension)) {
+    return null;
+  }
+
+  return value;
+}
+
+function extractCandidatePathsFromLogs(serializedLogs: string): string[] {
+  const candidates = serializedLogs.match(/[A-Za-z0-9._/-]+\.[A-Za-z0-9]+(?::\d+(?::\d+)?)?/g) ?? [];
+  const seen = new Set<string>();
+  const output: string[] = [];
+
+  for (const candidate of candidates) {
+    const normalized = normalizeCandidatePath(candidate);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+
+    seen.add(normalized);
+    output.push(normalized);
+    if (output.length >= MAX_CANDIDATE_PATHS) {
+      break;
+    }
+  }
+
+  return output;
+}
+
+async function collectRelevantFileContexts(
+  sandbox: Sandbox,
+  session: RunSession,
+  serializedLogs: string,
+): Promise<{ contextText: string; trace: TraceEvent[] }> {
+  const trace: TraceEvent[] = [];
+  const candidates = extractCandidatePathsFromLogs(serializedLogs);
+  if (!candidates.length) {
+    return { contextText: "", trace };
+  }
+
+  const blocks: string[] = [];
+  for (const filePath of candidates) {
+    const show = await runSafeCommand(sandbox, {
+      step: `read-context-${filePath}`,
+      cmd: "git",
+      args: ["show", `HEAD:${filePath}`],
+      cwd: session.repoRoot,
+      timeoutMs: 30_000,
+      inputSummary: filePath,
+    });
+    trace.push(show.trace);
+
+    if (show.exitCode !== 0 || !show.stdout.trim()) {
+      continue;
+    }
+
+    blocks.push(`FILE: ${filePath}\n${truncate(show.stdout, MAX_CONTEXT_FILE_CHARS)}`);
+    if (blocks.length >= MAX_CONTEXT_FILES) {
+      break;
+    }
+  }
+
+  if (!blocks.length) {
+    return { contextText: "", trace };
+  }
+
+  return {
+    contextText: [
+      "Repository file snapshots (authoritative current content; use these exact lines for patch hunks):",
+      ...blocks,
+    ].join("\n\n"),
+    trace,
+  };
+}
+
 function isResponsesApiModel(model: string): boolean {
   return model.trim().toLowerCase().startsWith("gpt-5-mini");
 }
@@ -775,6 +892,38 @@ function parseProposalJson(rawText: string): { explanation?: string; diff?: stri
   );
 }
 
+function parseSectionedProposal(rawText: string): { explanation?: string; diff?: string } | null {
+  const xmlExplanation = rawText.match(/<explanation>\s*([\s\S]*?)\s*<\/explanation>/i)?.[1]?.trim();
+  const xmlDiff = rawText.match(/<diff>\s*([\s\S]*?)\s*<\/diff>/i)?.[1]?.trim();
+  if (xmlDiff) {
+    return {
+      explanation: xmlExplanation || "No explanation was returned.",
+      diff: xmlDiff,
+    };
+  }
+
+  const diffSectionMatch = rawText.match(/(?:^|\n)DIFF:\s*/i);
+  if (!diffSectionMatch || diffSectionMatch.index == null) {
+    return null;
+  }
+
+  const diffBody = rawText.slice(diffSectionMatch.index + diffSectionMatch[0].length).trim();
+  if (!diffBody) {
+    return null;
+  }
+
+  const diffMarker = diffBody.search(/diff --git /);
+  const diff = (diffMarker >= 0 ? diffBody.slice(diffMarker) : diffBody).trim();
+  if (!diff) {
+    return null;
+  }
+
+  const explanationMatch = rawText.match(/(?:^|\n)EXPLANATION:\s*([\s\S]*?)(?:\nDIFF:\s*|$)/i);
+  const explanation = explanationMatch?.[1]?.trim() || "No explanation was returned.";
+
+  return { explanation, diff };
+}
+
 function unescapeJsonLikeString(value: string): string {
   return value
     .replace(/\\\\/g, "\\")
@@ -785,6 +934,11 @@ function unescapeJsonLikeString(value: string): string {
 }
 
 function parseProposalContent(rawText: string): { explanation?: string; diff?: string } {
+  const sectioned = parseSectionedProposal(rawText);
+  if (sectioned) {
+    return sectioned;
+  }
+
   try {
     return parseProposalJson(rawText);
   } catch (error) {
@@ -987,17 +1141,29 @@ export async function proposeFix(input: {
     : "https://api.openai.com/v1/chat/completions";
   const toolName = useResponsesApi ? "openai.responses" : "openai.chat.completions";
   const debugLlm = process.env.DEBUG_LLM === "1";
+  const trace: TraceEvent[] = [];
 
-  const systemPrompt =
-    "You are a CI-fix agent. Output ONLY valid JSON with keys explanation (string) and diff (string). " +
-    "The diff must be a valid unified diff against the repository root, start with 'diff --git', " +
-    "and include hunk lines that begin with '@@'.";
+  const contextResult = await collectRelevantFileContexts(sandbox, session, serializedLogs);
+  trace.push(...contextResult.trace);
+
+  const systemPrompt = [
+    "You are a CI-fix agent.",
+    "Return plain text with exactly two sections and no markdown fences:",
+    "EXPLANATION:",
+    "<one concise paragraph>",
+    "DIFF:",
+    "<a complete unified diff>",
+    "Rules for DIFF:",
+    "- Start with 'diff --git'.",
+    "- Use numeric hunk headers: @@ -<start>,<count> +<start>,<count> @@",
+    "- Do not output bare '@@' headers.",
+    "- Do not use placeholders like '<snip>' or '[truncated]'.",
+    "- The patch must apply with: git apply --check --whitespace=fix --recount",
+  ].join("\n");
 
   const prompt = [
     "Given repository metadata and failing CI logs, produce a likely minimal patch.",
-    "Return ONLY JSON and no markdown fences.",
-    "Required JSON keys: explanation (string), diff (string).",
-    "The diff value must be raw unified patch text (not prose) and should begin with 'diff --git'.",
+    "Return only the EXPLANATION and DIFF sections defined above.",
     "If uncertain, still propose the smallest safe patch.",
     "",
     `Framework guess: ${session.frameworkGuess}`,
@@ -1007,9 +1173,9 @@ export async function proposeFix(input: {
     "",
     "Failing logs:",
     serializedLogs,
+    contextResult.contextText,
   ].join("\n");
 
-  const trace: TraceEvent[] = [];
   let lastFailure = "";
   let lastRawOutput = "";
 
@@ -1022,7 +1188,7 @@ export async function proposeFix(input: {
             "",
             "The previous patch was invalid.",
             `Failure reason: ${lastFailure || "Invalid patch format"}`,
-            "Return a complete corrected unified diff. Do not truncate output.",
+            "Return a complete corrected patch in EXPLANATION/DIFF format. Do not truncate output.",
           ].join("\n");
 
     const requestBody = useResponsesApi
@@ -1043,7 +1209,6 @@ export async function proposeFix(input: {
       : {
           model,
           max_tokens: LLM_MAX_OUTPUT_TOKENS,
-          response_format: { type: "json_object" },
           messages: [
             {
               role: "system",
