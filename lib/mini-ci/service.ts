@@ -47,7 +47,7 @@ const MAX_OUTPUT_CHARS = 12_000;
 const TRACE_SNIPPET_CHARS = 240;
 const MAX_PROPOSE_LOG_CHARS = 20_000;
 const MAX_DIFF_CHARS = 100_000;
-const LLM_MAX_OUTPUT_TOKENS = 1800;
+const LLM_MAX_OUTPUT_TOKENS = 2200;
 const MAX_OPENAI_ERROR_CHARS = 20_000;
 const MAX_PROPOSE_ATTEMPTS = 3;
 const MAX_CONTEXT_FILES = 3;
@@ -89,6 +89,17 @@ type SafeCommandResult = {
   durationMs: number;
   commandLabel: string;
   trace: TraceEvent;
+};
+
+type StructuredEdit = {
+  filePath: string;
+  find: string;
+  replace: string;
+};
+
+type StructuredEditsProposal = {
+  explanation?: string;
+  edits?: StructuredEdit[];
 };
 
 type DetectInfo = {
@@ -770,6 +781,328 @@ async function collectRelevantFileContexts(
   };
 }
 
+function parseStructuredEditsProposal(rawText: string): StructuredEditsProposal {
+  const parsed = parseProposalJson(rawText) as {
+    explanation?: unknown;
+    edits?: unknown;
+  };
+
+  const explanation = typeof parsed.explanation === "string" ? parsed.explanation.trim() : "";
+  const rawEdits = Array.isArray(parsed.edits) ? parsed.edits : [];
+  const edits: StructuredEdit[] = [];
+
+  for (const candidate of rawEdits) {
+    if (!candidate || typeof candidate !== "object") {
+      continue;
+    }
+    const asRecord = candidate as Record<string, unknown>;
+    const filePath = typeof asRecord.filePath === "string" ? normalizeCandidatePath(asRecord.filePath) : null;
+    const find = typeof asRecord.find === "string" ? asRecord.find : null;
+    const replace = typeof asRecord.replace === "string" ? asRecord.replace : null;
+    if (!filePath || find == null || replace == null || !find) {
+      continue;
+    }
+    edits.push({ filePath, find, replace });
+    if (edits.length >= 6) {
+      break;
+    }
+  }
+
+  return {
+    explanation,
+    edits,
+  };
+}
+
+async function readFileAtHead(
+  sandbox: Sandbox,
+  session: RunSession,
+  filePath: string,
+): Promise<{ content: string; trace: TraceEvent }> {
+  const show = await runSafeCommand(sandbox, {
+    step: `read-head-${filePath}`,
+    cmd: "git",
+    args: ["show", `HEAD:${filePath}`],
+    cwd: session.repoRoot,
+    timeoutMs: 30_000,
+    inputSummary: filePath,
+  });
+
+  if (show.exitCode !== 0) {
+    const message = (show.stderr || show.stdout || `Failed to read ${filePath}`).trim();
+    throw new MiniCiServiceError(`Unable to read '${filePath}' from repository HEAD: ${message}`, 502);
+  }
+
+  return {
+    content: show.stdout,
+    trace: show.trace,
+  };
+}
+
+function applyStructuredEditsToContent(filePath: string, baseContent: string, edits: StructuredEdit[]): string {
+  let content = baseContent;
+
+  for (const edit of edits) {
+    const index = content.indexOf(edit.find);
+    if (index === -1) {
+      throw new MiniCiServiceError(
+        `Structured edit could not find target snippet in '${filePath}'.`,
+        502,
+      );
+    }
+
+    content = `${content.slice(0, index)}${edit.replace}${content.slice(index + edit.find.length)}`;
+  }
+
+  return content;
+}
+
+async function buildDiffFromUpdatedFiles(
+  sandbox: Sandbox,
+  session: RunSession,
+  updatedFiles: Map<string, string>,
+): Promise<{ diff: string; trace: TraceEvent[] }> {
+  const trace: TraceEvent[] = [];
+  const tempRoot = `${session.repoRoot}/.mini-ci-agent-candidate-${randomUUID()}`;
+
+  await sandbox.writeFiles(
+    [...updatedFiles.entries()].map(([filePath, content]) => ({
+      path: `${tempRoot}/${filePath}`,
+      content: Buffer.from(content, "utf8"),
+    })),
+  );
+
+  trace.push({
+    ts: nowIso(),
+    step: "write-structured-candidate-files",
+    tool: "sandbox.writeFiles",
+    inputSummary: `${updatedFiles.size} file(s) under ${tempRoot}`,
+    exitCode: 0,
+    stdoutSnippet: "Candidate files written for diff generation.",
+    stderrSnippet: "",
+    durationMs: 0,
+  });
+
+  const chunks: string[] = [];
+  for (const filePath of updatedFiles.keys()) {
+    const candidatePath = `${tempRoot}/${filePath}`;
+    const diffResult = await runSafeCommand(sandbox, {
+      step: `diff-structured-${filePath}`,
+      cmd: "git",
+      args: [
+        "diff",
+        "--no-index",
+        "--unified=3",
+        "--label",
+        `a/${filePath}`,
+        "--label",
+        `b/${filePath}`,
+        "--",
+        filePath,
+        candidatePath,
+      ],
+      cwd: session.repoRoot,
+      timeoutMs: 30_000,
+      inputSummary: filePath,
+    });
+    trace.push(diffResult.trace);
+
+    if (diffResult.exitCode === 1 && diffResult.stdout.trim()) {
+      chunks.push(diffResult.stdout.trim());
+      continue;
+    }
+    if (diffResult.exitCode === 0) {
+      continue;
+    }
+
+    const reason = (diffResult.stderr || diffResult.stdout || "git diff failed").trim();
+    throw new MiniCiServiceError(`Unable to generate diff for '${filePath}': ${reason}`, 502);
+  }
+
+  return {
+    diff: chunks.join("\n\n").trim(),
+    trace,
+  };
+}
+
+async function proposeFixWithStructuredEditsFallback(input: {
+  sandbox: Sandbox;
+  session: RunSession;
+  model: string;
+  useResponsesApi: boolean;
+  endpoint: string;
+  key: string;
+  toolName: string;
+  debugLlm: boolean;
+  serializedLogs: string;
+  contextText: string;
+  failureReason: string;
+}): Promise<{ explanation: string; diff: string; trace: TraceEvent[] }> {
+  const trace: TraceEvent[] = [];
+
+  const fallbackSystemPrompt = [
+    "You are a CI-fix agent fallback mode.",
+    "Return ONLY valid JSON with keys:",
+    "- explanation: string",
+    "- edits: array of { filePath: string, find: string, replace: string }",
+    "Rules:",
+    "- Provide 1 to 3 edits only.",
+    "- filePath must be repository-relative.",
+    "- find must be an exact snippet from the target file.",
+    "- replace must be the exact replacement snippet.",
+    "- Do not return unified diff text.",
+    "- Do not include markdown fences.",
+  ].join("\n");
+
+  const fallbackPrompt = [
+    "Previous direct unified diff attempts failed to apply.",
+    `Failure reason: ${input.failureReason}`,
+    "Provide exact textual find/replace edits so patch can be generated deterministically.",
+    "",
+    `Framework guess: ${input.session.frameworkGuess}`,
+    `Package manager: ${input.session.packageManager}`,
+    `Scripts: ${JSON.stringify(input.session.scripts)}`,
+    `Top-level files: ${JSON.stringify(input.session.topLevelTree)}`,
+    "",
+    "Failing logs:",
+    input.serializedLogs,
+    input.contextText,
+  ].join("\n");
+
+  const requestBody = input.useResponsesApi
+    ? {
+        model: input.model,
+        input: [
+          {
+            role: "system",
+            content: [{ type: "input_text", text: fallbackSystemPrompt }],
+          },
+          {
+            role: "user",
+            content: [{ type: "input_text", text: fallbackPrompt }],
+          },
+        ],
+        reasoning: { effort: "low" },
+        text: { verbosity: "low" },
+        max_output_tokens: LLM_MAX_OUTPUT_TOKENS,
+      }
+    : {
+        model: input.model,
+        max_tokens: LLM_MAX_OUTPUT_TOKENS,
+        response_format: { type: "json_object" },
+        messages: [
+          {
+            role: "system",
+            content: fallbackSystemPrompt,
+          },
+          {
+            role: "user",
+            content: fallbackPrompt,
+          },
+        ],
+      };
+
+  const startedAt = Date.now();
+  const response = await fetch(input.endpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${input.key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(requestBody),
+  });
+  const durationMs = Date.now() - startedAt;
+  const payload = await parseJsonOrTextBody(response);
+
+  if (!response.ok) {
+    const openAiError = serializeOpenAiError(payload);
+    if (input.debugLlm) {
+      console.error("OpenAI structured-fallback error payload:", payload);
+    }
+
+    trace.push({
+      ts: nowIso(),
+      step: "propose-fix-structured-fallback",
+      tool: input.toolName,
+      inputSummary: `model=${input.model}`,
+      exitCode: 1,
+      stdoutSnippet: "",
+      stderrSnippet: truncate(openAiError, TRACE_SNIPPET_CHARS),
+      durationMs,
+    });
+
+    throw new MiniCiServiceError(
+      `OpenAI request failed during structured fallback (${response.status} ${response.statusText}): ${openAiError}`,
+      502,
+    );
+  }
+
+  const modelText = input.useResponsesApi
+    ? extractResponsesText(payload)
+    : extractChatCompletionsText(payload);
+  if (!modelText) {
+    throw new MiniCiServiceError("Structured fallback returned empty content.", 502);
+  }
+
+  const proposal = parseStructuredEditsProposal(modelText);
+  const edits = proposal.edits ?? [];
+  if (!edits.length) {
+    throw new MiniCiServiceError(
+      `Structured fallback returned no usable edits. Raw output: ${truncate(modelText, 1500)}`,
+      502,
+    );
+  }
+
+  const byFile = new Map<string, StructuredEdit[]>();
+  for (const edit of edits.slice(0, 3)) {
+    const list = byFile.get(edit.filePath) ?? [];
+    list.push(edit);
+    byFile.set(edit.filePath, list);
+  }
+
+  const updatedFiles = new Map<string, string>();
+  for (const [filePath, fileEdits] of byFile.entries()) {
+    const currentFile = await readFileAtHead(input.sandbox, input.session, filePath);
+    trace.push(currentFile.trace);
+
+    const updated = applyStructuredEditsToContent(filePath, currentFile.content, fileEdits);
+    if (updated !== currentFile.content) {
+      updatedFiles.set(filePath, updated);
+    }
+  }
+
+  if (!updatedFiles.size) {
+    throw new MiniCiServiceError("Structured fallback produced no file changes.", 502);
+  }
+
+  const diffResult = await buildDiffFromUpdatedFiles(input.sandbox, input.session, updatedFiles);
+  trace.push(...diffResult.trace);
+
+  const diff = normalizeDiffPatch(diffResult.diff);
+  const validation = validateUnifiedDiff(diff);
+  if (!validation.ok) {
+    throw new MiniCiServiceError(
+      `Structured fallback generated invalid unified patch (${validation.reason}).`,
+      502,
+    );
+  }
+
+  const patchCheck = await checkPatchInSandbox(input.sandbox, input.session, diff, 99);
+  trace.push(...patchCheck.trace);
+  if (!patchCheck.ok) {
+    throw new MiniCiServiceError(
+      `Structured fallback patch is not applicable in sandbox: ${patchCheck.reason}`,
+      502,
+    );
+  }
+
+  return {
+    explanation: proposal.explanation || "Generated a deterministic patch from structured edits.",
+    diff,
+    trace,
+  };
+}
+
 function isResponsesApiModel(model: string): boolean {
   return model.trim().toLowerCase().startsWith("gpt-5-mini");
 }
@@ -797,6 +1130,20 @@ function serializeUnknown(input: unknown): string {
 
 function serializeOpenAiError(payload: unknown): string {
   return truncate(serializeUnknown(payload), MAX_OPENAI_ERROR_CHARS);
+}
+
+function getResponsesIncompleteReason(payload: unknown): string {
+  if (!payload || typeof payload !== "object") {
+    return "";
+  }
+
+  const details = (payload as { incomplete_details?: unknown }).incomplete_details;
+  if (!details || typeof details !== "object") {
+    return "";
+  }
+
+  const reason = (details as { reason?: unknown }).reason;
+  return typeof reason === "string" ? reason : "";
 }
 
 function extractResponsesText(payload: unknown): string {
@@ -1178,6 +1525,7 @@ export async function proposeFix(input: {
 
   let lastFailure = "";
   let lastRawOutput = "";
+  let terminalFailure = "";
 
   for (let attempt = 1; attempt <= MAX_PROPOSE_ATTEMPTS; attempt += 1) {
     const attemptPrompt =
@@ -1204,6 +1552,8 @@ export async function proposeFix(input: {
               content: [{ type: "input_text", text: attemptPrompt }],
             },
           ],
+          reasoning: { effort: "low" },
+          text: { verbosity: "low" },
           max_output_tokens: LLM_MAX_OUTPUT_TOKENS,
         }
       : {
@@ -1259,6 +1609,11 @@ export async function proposeFix(input: {
     const modelText = useResponsesApi ? extractResponsesText(payload) : extractChatCompletionsText(payload);
     if (!modelText) {
       const serializedPayload = serializeOpenAiError(payload);
+      const incompleteReason = useResponsesApi ? getResponsesIncompleteReason(payload) : "";
+      const failureMessage = incompleteReason
+        ? `LLM returned empty content (incomplete: ${incompleteReason}).`
+        : "LLM returned empty content.";
+
       trace.push({
         ts: nowIso(),
         step: `propose-fix-attempt-${attempt}`,
@@ -1266,14 +1621,16 @@ export async function proposeFix(input: {
         inputSummary: `model=${model}`,
         exitCode: 1,
         stdoutSnippet: "",
-        stderrSnippet: truncate("LLM returned empty content.", TRACE_SNIPPET_CHARS),
+        stderrSnippet: truncate(failureMessage, TRACE_SNIPPET_CHARS),
         durationMs,
       });
 
-      throw new MiniCiServiceError(
-        `LLM returned empty content. Response payload: ${serializedPayload}`,
-        502,
-      );
+      lastFailure = `${failureMessage} Response payload: ${serializedPayload}`;
+      if (attempt < MAX_PROPOSE_ATTEMPTS) {
+        continue;
+      }
+      terminalFailure = lastFailure;
+      break;
     }
 
     lastRawOutput = modelText;
@@ -1299,7 +1656,8 @@ export async function proposeFix(input: {
         continue;
       }
 
-      throw error;
+      terminalFailure = `Model output was not parseable JSON: ${message}`;
+      break;
     }
 
     const explanation = parsed.explanation?.trim() || "No explanation was returned.";
@@ -1323,7 +1681,8 @@ export async function proposeFix(input: {
       if (attempt < MAX_PROPOSE_ATTEMPTS) {
         continue;
       }
-      throw new MiniCiServiceError(lastFailure, 502);
+      terminalFailure = lastFailure;
+      break;
     }
 
     if (diff.length > MAX_DIFF_CHARS) {
@@ -1331,7 +1690,8 @@ export async function proposeFix(input: {
       if (attempt < MAX_PROPOSE_ATTEMPTS) {
         continue;
       }
-      throw new MiniCiServiceError(lastFailure, 502);
+      terminalFailure = lastFailure;
+      break;
     }
 
     if (!validation.ok) {
@@ -1339,10 +1699,8 @@ export async function proposeFix(input: {
       if (attempt < MAX_PROPOSE_ATTEMPTS) {
         continue;
       }
-      throw new MiniCiServiceError(
-        `LLM returned an invalid unified patch: ${lastFailure}. Raw diff snippet: ${truncate(rawDiff, 1500)}`,
-        502,
-      );
+      terminalFailure = `LLM returned an invalid unified patch: ${lastFailure}. Raw diff snippet: ${truncate(rawDiff, 1500)}`;
+      break;
     }
 
     const patchCheck = await checkPatchInSandbox(sandbox, session, diff, attempt);
@@ -1352,10 +1710,8 @@ export async function proposeFix(input: {
       if (attempt < MAX_PROPOSE_ATTEMPTS) {
         continue;
       }
-      throw new MiniCiServiceError(
-        `Generated patch is not applicable in sandbox: ${patchCheck.reason}`,
-        502,
-      );
+      terminalFailure = `Generated patch is not applicable in sandbox: ${patchCheck.reason}`;
+      break;
     }
 
     return {
@@ -1366,10 +1722,38 @@ export async function proposeFix(input: {
     };
   }
 
-  throw new MiniCiServiceError(
-    `Unable to generate a valid patch after ${MAX_PROPOSE_ATTEMPTS} attempts. Raw output: ${truncate(lastRawOutput, 1500)}`,
-    502,
-  );
+  const fallbackReason =
+    terminalFailure
+    || lastFailure
+    || `Unable to generate a valid patch after ${MAX_PROPOSE_ATTEMPTS} attempts. Raw output: ${truncate(lastRawOutput, 1500)}`;
+
+  try {
+    const fallbackResult = await proposeFixWithStructuredEditsFallback({
+      sandbox,
+      session,
+      model,
+      useResponsesApi,
+      endpoint,
+      key,
+      toolName,
+      debugLlm,
+      serializedLogs,
+      contextText: contextResult.contextText,
+      failureReason: fallbackReason,
+    });
+    trace.push(...fallbackResult.trace);
+    return {
+      runId: session.runId,
+      explanation: fallbackResult.explanation,
+      diff: fallbackResult.diff,
+      trace,
+    };
+  } catch (fallbackError) {
+    throw new MiniCiServiceError(
+      `${fallbackReason}. Structured fallback failed: ${toErrorMessage(fallbackError)}`,
+      502,
+    );
+  }
 }
 
 export async function applyFix(input: {
