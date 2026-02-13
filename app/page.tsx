@@ -9,6 +9,7 @@ import type {
   ProposeFixResponse,
   RepoSummary,
   RunCiResponse,
+  SessionHint,
   TraceEvent,
 } from "@/lib/mini-ci/contracts";
 
@@ -60,6 +61,7 @@ export default function HomePage() {
   const [errorMessage, setErrorMessage] = useState<string>("");
 
   const [repoSummary, setRepoSummary] = useState<RepoSummary | null>(null);
+  const [sessionHint, setSessionHint] = useState<SessionHint | null>(null);
   const [ciResult, setCiResult] = useState<RunCiResponse | null>(null);
   const [proposal, setProposal] = useState<ProposeFixResponse | null>(null);
   const [applyResult, setApplyResult] = useState<ApplyFixResponse | null>(null);
@@ -99,6 +101,7 @@ export default function HomePage() {
 
       setRunId(response.runId);
       setRepoSummary(response.summary);
+      setSessionHint(response.sessionHint);
       setCiResult(null);
       setProposal(null);
       setApplyResult(null);
@@ -113,7 +116,10 @@ export default function HomePage() {
     }
 
     await withAction("run-ci", async () => {
-      const response = await postJson<RunCiResponse>("/api/run-ci", { runId });
+      const response = await postJson<RunCiResponse>("/api/run-ci", {
+        runId,
+        sessionHint,
+      });
       setCiResult(response);
       setApplyResult(null);
       setTimeline((current) => [...current, ...response.trace]);
@@ -131,6 +137,7 @@ export default function HomePage() {
       const response = await postJson<ProposeFixResponse>("/api/propose-fix", {
         runId,
         failingLogs,
+        sessionHint,
       });
       setProposal(response);
       setTimeline((current) => [...current, ...response.trace]);
@@ -152,6 +159,7 @@ export default function HomePage() {
       const response = await postJson<ApplyFixResponse>("/api/apply-fix", {
         runId,
         diff: proposal.diff,
+        sessionHint,
       });
       setApplyResult(response);
       setTimeline((current) => [...current, ...response.trace]);

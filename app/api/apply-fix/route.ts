@@ -1,12 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 
+import type { SessionHint } from "@/lib/mini-ci/contracts";
 import { applyFix } from "@/lib/mini-ci/service";
 
 export const runtime = "nodejs";
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
   try {
-    const body = (await request.json()) as { runId?: string; diff?: string };
+    const body = (await request.json()) as {
+      runId?: string;
+      diff?: string;
+      sessionHint?: SessionHint;
+    };
     if (!body.runId || typeof body.runId !== "string") {
       return NextResponse.json({ error: "runId is required." }, { status: 400 });
     }
@@ -18,6 +23,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const result = await applyFix({
       runId: body.runId,
       diff: body.diff,
+      sessionHint: body.sessionHint,
     });
 
     return NextResponse.json(result);

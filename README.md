@@ -96,6 +96,7 @@ Each action calls one backend route and appends trace events to the timeline.
 
 `/lib/mini-ci/service.ts` handles:
 - In-memory `runId -> sandbox session` map
+- Session hint rehydration so serverless cold starts can restore sandbox context per request
 - Command execution with:
   - Allowlist enforcement (`git`, `node`, `npm`, `pnpm`, `yarn`, `python`)
   - Timeout via detached command + `SIGTERM` kill

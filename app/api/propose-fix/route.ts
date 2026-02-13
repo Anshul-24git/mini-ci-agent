@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
+import type { SessionHint } from "@/lib/mini-ci/contracts";
 import { MiniCiServiceError, proposeFix } from "@/lib/mini-ci/service";
 
 export const runtime = "nodejs";
@@ -15,7 +16,11 @@ function shortenErrorMessage(input: string, maxChars = 1200): string {
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
   try {
-    const body = (await request.json()) as { runId?: string; failingLogs?: unknown };
+    const body = (await request.json()) as {
+      runId?: string;
+      failingLogs?: unknown;
+      sessionHint?: SessionHint;
+    };
     if (!body.runId || typeof body.runId !== "string") {
       return NextResponse.json({ error: "runId is required.", statusCode: 400 }, { status: 400 });
     }
@@ -23,6 +28,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     const result = await proposeFix({
       runId: body.runId,
       failingLogs: body.failingLogs,
+      sessionHint: body.sessionHint,
     });
 
     return NextResponse.json(result);

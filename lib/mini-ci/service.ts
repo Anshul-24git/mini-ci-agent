@@ -12,6 +12,7 @@ import type {
   ProposeFixResponse,
   RepoSummary,
   RunCiResponse,
+  SessionHint,
   TraceEvent,
 } from "@/lib/mini-ci/contracts";
 
@@ -293,6 +294,69 @@ function requireSession(runId: string): RunSession {
   return session;
 }
 
+function buildSessionHintFromSession(session: RunSession): SessionHint {
+  return {
+    runId: session.runId,
+    sandboxId: session.sandboxId,
+    repoRoot: session.repoRoot,
+    repoUrl: session.repoUrl,
+    hasPackageJson: session.hasPackageJson,
+    packageManager: session.packageManager,
+    scripts: session.scripts,
+    frameworkGuess: session.frameworkGuess,
+    topLevelTree: session.topLevelTree,
+  };
+}
+
+function buildSessionFromHint(runId: string, hint?: SessionHint): RunSession | null {
+  if (!hint) {
+    return null;
+  }
+
+  if (hint.runId && hint.runId !== runId) {
+    throw new MiniCiServiceError("runId does not match session hint.", 400);
+  }
+
+  if (!hint.sandboxId || !hint.repoRoot) {
+    throw new MiniCiServiceError(
+      "Session hint is incomplete. Run Analyze Repo again to refresh sandbox context.",
+      400,
+    );
+  }
+
+  const now = Date.now();
+  return {
+    runId,
+    repoUrl: hint.repoUrl || "",
+    sandboxId: hint.sandboxId,
+    repoRoot: hint.repoRoot,
+    hasPackageJson: hint.hasPackageJson,
+    packageManager: hint.packageManager,
+    scripts: hint.scripts ?? {},
+    frameworkGuess: hint.frameworkGuess || "Unknown",
+    topLevelTree: hint.topLevelTree ?? [],
+    lastCiLogs: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function resolveSession(runId: string, hint?: SessionHint): RunSession {
+  validateRunId(runId);
+  const existing = runSessions.get(runId);
+  if (existing) {
+    return existing;
+  }
+
+  const hydrated = buildSessionFromHint(runId, hint);
+  if (hydrated) {
+    runSessions.set(runId, hydrated);
+    return hydrated;
+  }
+
+  throw new MiniCiServiceError("No sandbox session found for this runId. Run analyze first.", 500);
+}
+
 function createSkippedLog(step: string, reason: string): CiStepLog {
   return {
     step,
@@ -534,7 +598,7 @@ export async function analyzeRepository(input: { runId?: string; repoUrl: string
     fileTreeTopLevel,
   };
 
-  runSessions.set(runId, {
+  const session: RunSession = {
     runId,
     repoUrl,
     sandboxId: sandbox.sandboxId,
@@ -547,18 +611,20 @@ export async function analyzeRepository(input: { runId?: string; repoUrl: string
     lastCiLogs: [],
     createdAt: Date.now(),
     updatedAt: Date.now(),
-  });
+  };
+  runSessions.set(runId, session);
 
   return {
     runId,
     sandboxId: sandbox.sandboxId,
     summary,
+    sessionHint: buildSessionHintFromSession(session),
     trace,
   };
 }
 
-export async function runCi(runId: string): Promise<RunCiResponse> {
-  const session = requireSession(runId);
+export async function runCi(runId: string, sessionHint?: SessionHint): Promise<RunCiResponse> {
+  const session = resolveSession(runId, sessionHint);
   const credentials = getSandboxCredentialsFromEnv();
   const sandbox = await Sandbox.get({
     ...(credentials ?? {}),
@@ -708,8 +774,12 @@ function parseProposalJson(rawText: string): { explanation?: string; diff?: stri
   );
 }
 
-export async function proposeFix(input: { runId: string; failingLogs?: unknown }): Promise<ProposeFixResponse> {
-  const session = requireSession(input.runId);
+export async function proposeFix(input: {
+  runId: string;
+  failingLogs?: unknown;
+  sessionHint?: SessionHint;
+}): Promise<ProposeFixResponse> {
+  const session = resolveSession(input.runId, input.sessionHint);
   const key = process.env.OPENAI_API_KEY;
   if (!key) {
     throw new MiniCiServiceError("OPENAI_API_KEY is missing on the server.", 500);
@@ -858,8 +928,12 @@ export async function proposeFix(input: { runId: string; failingLogs?: unknown }
   };
 }
 
-export async function applyFix(input: { runId: string; diff: string }): Promise<ApplyFixResponse> {
-  const session = requireSession(input.runId);
+export async function applyFix(input: {
+  runId: string;
+  diff: string;
+  sessionHint?: SessionHint;
+}): Promise<ApplyFixResponse> {
+  const session = resolveSession(input.runId, input.sessionHint);
   const rawDiff = input.diff.trim();
   if (!rawDiff) {
     throw new Error("Diff is required.");

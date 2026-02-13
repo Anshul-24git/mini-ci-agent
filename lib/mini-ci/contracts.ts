@@ -18,6 +18,18 @@ export type RepoSummary = {
   fileTreeTopLevel: string[];
 };
 
+export type SessionHint = {
+  runId: string;
+  sandboxId: string;
+  repoRoot: string;
+  repoUrl: string;
+  hasPackageJson: boolean;
+  packageManager: PackageManager;
+  scripts: Record<string, string>;
+  frameworkGuess: string;
+  topLevelTree: string[];
+};
+
 export type CiStepStatus = "passed" | "failed" | "skipped";
 
 export type CiStepLog = {
@@ -34,6 +46,7 @@ export type AnalyzeResponse = {
   runId: string;
   sandboxId: string;
   summary: RepoSummary;
+  sessionHint: SessionHint;
   trace: TraceEvent[];
 };
 
