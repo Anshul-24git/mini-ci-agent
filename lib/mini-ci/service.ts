@@ -27,6 +27,7 @@ type RunSession = {
   frameworkGuess: string;
   topLevelTree: string[];
   lastCiLogs: CiStepLog[];
+  lastProposedDiff: string;
   createdAt: number;
   updatedAt: number;
 };
@@ -372,6 +373,7 @@ function buildSessionFromHint(runId: string, hint?: SessionHint): RunSession | n
     frameworkGuess: hint.frameworkGuess || "Unknown",
     topLevelTree: hint.topLevelTree ?? [],
     lastCiLogs: [],
+    lastProposedDiff: "",
     createdAt: now,
     updatedAt: now,
   };
@@ -521,6 +523,7 @@ async function executeCi(session: RunSession, sandbox: Sandbox): Promise<{ passe
 
   const passed = logs.every((log) => log.status !== "failed");
   session.lastCiLogs = logs;
+  session.lastProposedDiff = "";
   session.updatedAt = Date.now();
   runSessions.set(session.runId, session);
 
@@ -645,6 +648,7 @@ export async function analyzeRepository(input: { runId?: string; repoUrl: string
     frameworkGuess: detectInfo.frameworkGuess,
     topLevelTree: fileTreeTopLevel,
     lastCiLogs: [],
+    lastProposedDiff: "",
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
@@ -1777,6 +1781,10 @@ export async function proposeFix(input: {
       break;
     }
 
+    session.lastProposedDiff = diff;
+    session.updatedAt = Date.now();
+    runSessions.set(session.runId, session);
+
     return {
       runId: session.runId,
       explanation,
@@ -1805,6 +1813,9 @@ export async function proposeFix(input: {
       failureReason: fallbackReason,
     });
     trace.push(...fallbackResult.trace);
+    session.lastProposedDiff = fallbackResult.diff;
+    session.updatedAt = Date.now();
+    runSessions.set(session.runId, session);
     return {
       runId: session.runId,
       explanation: fallbackResult.explanation,
@@ -1825,19 +1836,46 @@ export async function applyFix(input: {
   sessionHint?: SessionHint;
 }): Promise<ApplyFixResponse> {
   const session = resolveSession(input.runId, input.sessionHint);
-  const normalizedDiff = normalizeDiffPatch(input.diff);
-  if (!normalizedDiff) {
+  const rawInputDiff = typeof input.diff === "string" ? input.diff : "";
+  if (!rawInputDiff.trim()) {
     throw new Error("Diff is required.");
   }
 
-  if (normalizedDiff.length > MAX_DIFF_CHARS) {
-    throw new Error(`Diff too large (>${MAX_DIFF_CHARS} chars).`);
+  const candidates = new Map<string, { label: string; diff: string }>();
+  const pushCandidate = (label: string, value: string): void => {
+    if (!value) {
+      return;
+    }
+
+    let candidate = value.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
+    if (candidate.includes("\\n") && !candidate.includes("\n")) {
+      candidate = candidate.replace(/\\n/g, "\n");
+    }
+    if (!candidate.trim()) {
+      return;
+    }
+    if (!candidate.endsWith("\n")) {
+      candidate += "\n";
+    }
+    if (candidate.length > MAX_DIFF_CHARS) {
+      return;
+    }
+
+    if (!candidates.has(candidate)) {
+      candidates.set(candidate, { label, diff: candidate });
+    }
+  };
+
+  pushCandidate("client-raw", rawInputDiff);
+  pushCandidate("client-normalized", normalizeDiffPatch(rawInputDiff));
+  if (session.lastProposedDiff) {
+    pushCandidate("session-last-proposed", session.lastProposedDiff);
+    pushCandidate("session-last-proposed-normalized", normalizeDiffPatch(session.lastProposedDiff));
   }
 
-  const validation = validateUnifiedDiff(normalizedDiff);
-  if (!validation.ok) {
+  if (candidates.size === 0) {
     throw new MiniCiServiceError(
-      `Proposed diff is not a valid unified patch (${validation.reason}). Please generate a new fix proposal.`,
+      `No valid patch candidates available (max size ${MAX_DIFF_CHARS} chars). Generate a new fix proposal.`,
       400,
     );
   }
@@ -1851,42 +1889,67 @@ export async function applyFix(input: {
   const logs: CiStepLog[] = [];
 
   const patchPath = `${session.repoRoot}/.mini-ci-agent.patch`;
-  const writeStartedAt = Date.now();
-  await sandbox.writeFiles([
-    {
-      path: patchPath,
-      content: Buffer.from(normalizedDiff, "utf8"),
-    },
-  ]);
+  let selectedDiff = "";
+  let selectedLabel = "";
+  let lastCheckResult: SafeCommandResult | null = null;
+  const candidateFailures: string[] = [];
 
-  trace.push({
-    ts: nowIso(),
-    step: "write-patch",
-    tool: "sandbox.writeFiles",
-    inputSummary: `${patchPath} (${normalizedDiff.length} chars)`,
-    exitCode: 0,
-    stdoutSnippet: "Patch written to sandbox.",
-    stderrSnippet: "",
-    durationMs: Date.now() - writeStartedAt,
-  });
+  for (const candidate of candidates.values()) {
+    const validation = validateUnifiedDiff(candidate.diff);
+    if (!validation.ok) {
+      candidateFailures.push(`${candidate.label}: invalid patch (${validation.reason}).`);
+      continue;
+    }
 
-  const checkPatchResult = await runSafeCommand(sandbox, {
-    step: "check-patch",
-    cmd: "git",
-    args: ["apply", "--check", "--whitespace=fix", "--recount", patchPath],
-    cwd: session.repoRoot,
-  });
-  trace.push(checkPatchResult.trace);
+    const writeStartedAt = Date.now();
+    await sandbox.writeFiles([
+      {
+        path: patchPath,
+        content: Buffer.from(candidate.diff, "utf8"),
+      },
+    ]);
 
-  if (checkPatchResult.exitCode !== 0) {
+    trace.push({
+      ts: nowIso(),
+      step: "write-patch",
+      tool: "sandbox.writeFiles",
+      inputSummary: `${patchPath} (${candidate.diff.length} chars from ${candidate.label})`,
+      exitCode: 0,
+      stdoutSnippet: "Patch written to sandbox.",
+      stderrSnippet: "",
+      durationMs: Date.now() - writeStartedAt,
+    });
+
+    const checkPatchResult = await runSafeCommand(sandbox, {
+      step: "check-patch",
+      cmd: "git",
+      args: ["apply", "--check", "--whitespace=fix", "--recount", patchPath],
+      cwd: session.repoRoot,
+    });
+    trace.push(checkPatchResult.trace);
+    lastCheckResult = checkPatchResult;
+
+    if (checkPatchResult.exitCode === 0) {
+      selectedDiff = candidate.diff;
+      selectedLabel = candidate.label;
+      break;
+    }
+
+    const checkReason =
+      (checkPatchResult.stderr || checkPatchResult.stdout || `git apply --check failed (${checkPatchResult.exitCode})`).trim();
+    candidateFailures.push(`${candidate.label}: ${checkReason}`);
+  }
+
+  if (!selectedDiff) {
+    const mergedReason = truncate(candidateFailures.join(" | "), MAX_OUTPUT_CHARS);
     logs.push({
       step: "apply_patch",
-      command: checkPatchResult.commandLabel,
+      command: lastCheckResult?.commandLabel ?? "git apply --check --whitespace=fix --recount",
       status: "failed",
-      exitCode: checkPatchResult.exitCode,
-      stdout: checkPatchResult.stdout,
-      stderr: checkPatchResult.stderr,
-      durationMs: checkPatchResult.durationMs,
+      exitCode: lastCheckResult?.exitCode ?? 1,
+      stdout: lastCheckResult?.stdout ?? "",
+      stderr: mergedReason || "No patch candidate passed git apply --check.",
+      durationMs: lastCheckResult?.durationMs ?? 0,
     });
     return {
       runId: session.runId,
@@ -1896,6 +1959,17 @@ export async function applyFix(input: {
       trace,
     };
   }
+
+  trace.push({
+    ts: nowIso(),
+    step: "patch-candidate-selected",
+    tool: "apply-fix",
+    inputSummary: selectedLabel,
+    exitCode: 0,
+    stdoutSnippet: truncate(selectedDiff, TRACE_SNIPPET_CHARS),
+    stderrSnippet: "",
+    durationMs: 0,
+  });
 
   const applyResult = await runSafeCommand(sandbox, {
     step: "apply-patch",
