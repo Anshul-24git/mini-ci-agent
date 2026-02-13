@@ -906,7 +906,13 @@ async function buildDiffFromUpdatedFiles(
       throw new MiniCiServiceError(`Unable to generate diff from structured edits: ${reason}`, 502);
     }
 
-    diff = diffResult.stdout.trim();
+    diff = diffResult.stdout;
+    if (diff.includes("...[truncated ")) {
+      throw new MiniCiServiceError(
+        "Structured fallback diff output was truncated before patch validation.",
+        502,
+      );
+    }
     if (!diff) {
       throw new MiniCiServiceError("Structured edits produced no diff output.", 502);
     }
@@ -1102,7 +1108,10 @@ async function proposeFixWithStructuredEditsFallback(input: {
   );
   trace.push(...diffResult.trace);
 
-  const diff = normalizeDiffPatch(diffResult.diff);
+  let diff = diffResult.diff.replace(/\r\n/g, "\n");
+  if (!diff.endsWith("\n")) {
+    diff += "\n";
+  }
   const validation = validateUnifiedDiff(diff);
   if (!validation.ok) {
     throw new MiniCiServiceError(
