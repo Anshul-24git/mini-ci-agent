@@ -47,8 +47,9 @@ const MAX_OUTPUT_CHARS = 12_000;
 const TRACE_SNIPPET_CHARS = 240;
 const MAX_PROPOSE_LOG_CHARS = 20_000;
 const MAX_DIFF_CHARS = 100_000;
-const LLM_MAX_OUTPUT_TOKENS = 1200;
+const LLM_MAX_OUTPUT_TOKENS = 2200;
 const MAX_OPENAI_ERROR_CHARS = 20_000;
+const MAX_PROPOSE_ATTEMPTS = 2;
 
 type SafeCommandInput = {
   step: string;
@@ -774,6 +775,49 @@ function parseProposalJson(rawText: string): { explanation?: string; diff?: stri
   );
 }
 
+function unescapeJsonLikeString(value: string): string {
+  return value
+    .replace(/\\\\/g, "\\")
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, "\n")
+    .replace(/\\r/g, "\r")
+    .replace(/\\t/g, "\t");
+}
+
+function parseProposalContent(rawText: string): { explanation?: string; diff?: string } {
+  try {
+    return parseProposalJson(rawText);
+  } catch (error) {
+    const explanationMatch = rawText.match(/"explanation"\s*:\s*"([\s\S]*?)"\s*,/);
+    const explanationFromJson = explanationMatch?.[1]
+      ? unescapeJsonLikeString(explanationMatch[1]).trim()
+      : "";
+
+    const diffFieldMatch = rawText.match(/"diff"\s*:\s*"([\s\S]*)/);
+    if (diffFieldMatch?.[1]) {
+      let encoded = diffFieldMatch[1];
+      encoded = encoded.replace(/"\s*[,}]\s*$/, "");
+      return {
+        explanation: explanationFromJson || "Model returned non-strict JSON output.",
+        diff: unescapeJsonLikeString(encoded).trim(),
+      };
+    }
+
+    const diffMarker = rawText.search(/diff --git /);
+    if (diffMarker !== -1) {
+      const explanationHead = rawText.slice(0, diffMarker).trim();
+      const explanation = explanationFromJson
+        || explanationHead.replace(/^["'{\s]+/, "").replace(/["'}\s,]+$/, "").trim()
+        || "Model returned patch without a structured explanation.";
+      const diff = rawText.slice(diffMarker).trim();
+
+      return { explanation, diff };
+    }
+
+    throw error;
+  }
+}
+
 function normalizeDiffPatch(rawDiff: string): string {
   let text = rawDiff.replace(/\r\n/g, "\n").trim();
   if (!text) {
@@ -790,52 +834,19 @@ function normalizeDiffPatch(rawDiff: string): string {
     text = text.slice(marker.index).trim();
   }
 
-  const lines = text.split("\n");
-  const cleaned: string[] = [];
-  let inFile = false;
-  let inHunk = false;
-
-  const fileMetaPattern =
-    /^(index |new file mode |deleted file mode |old mode |new mode |similarity index |rename from |rename to |--- |\+\+\+ |Binary files )/;
-
-  for (const line of lines) {
-    if (line.startsWith("diff --git ")) {
-      inFile = true;
-      inHunk = false;
-      cleaned.push(line);
-      continue;
-    }
-
-    if (!inFile) {
-      continue;
-    }
-
-    if (line.startsWith("@@")) {
-      inHunk = true;
-      cleaned.push(line);
-      continue;
-    }
-
-    if (fileMetaPattern.test(line)) {
-      inHunk = false;
-      cleaned.push(line);
-      continue;
-    }
-
-    if (inHunk) {
-      if (
-        line.startsWith("+") ||
-        line.startsWith("-") ||
-        line.startsWith(" ") ||
-        line === "\\ No newline at end of file"
-      ) {
-        cleaned.push(line);
-      }
-      continue;
-    }
+  if (!text.includes("\n") && text.includes("\\n")) {
+    text = text.replace(/\\n/g, "\n");
   }
 
-  return cleaned.join("\n").trim();
+  if (text.includes('\\"')) {
+    text = text.replace(/\\"/g, '"');
+  }
+
+  if (!text.endsWith("\n")) {
+    text += "\n";
+  }
+
+  return text.trim();
 }
 
 function hasUnifiedDiffStructure(diff: string): boolean {
@@ -849,6 +860,60 @@ function hasUnifiedDiffStructure(diff: string): boolean {
   const hasModeOnlyChange = /^(new file mode|deleted file mode|Binary files)/m.test(diff);
 
   return (hasGitHeader || hasFileHeaders) && (hasHunks || hasModeOnlyChange);
+}
+
+function validateUnifiedDiff(diff: string): { ok: boolean; reason?: string } {
+  if (!hasUnifiedDiffStructure(diff)) {
+    return { ok: false, reason: "Missing unified diff headers/hunks." };
+  }
+
+  const lines = diff.replace(/\r\n/g, "\n").split("\n");
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.startsWith("@@")) {
+      i += 1;
+      continue;
+    }
+
+    const match = line.match(/^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/);
+    if (!match) {
+      return { ok: false, reason: `Malformed hunk header: '${line}'.` };
+    }
+
+    const expectedOld = match[1] ? Number.parseInt(match[1], 10) : 1;
+    const expectedNew = match[2] ? Number.parseInt(match[2], 10) : 1;
+    let seenOld = 0;
+    let seenNew = 0;
+
+    i += 1;
+    while (i < lines.length && !lines[i].startsWith("@@") && !lines[i].startsWith("diff --git ")) {
+      const hunkLine = lines[i];
+      if (hunkLine.startsWith("+") && !hunkLine.startsWith("+++")) {
+        seenNew += 1;
+      } else if (hunkLine.startsWith("-") && !hunkLine.startsWith("---")) {
+        seenOld += 1;
+      } else if (hunkLine.startsWith(" ")) {
+        seenOld += 1;
+        seenNew += 1;
+      } else if (hunkLine === "\\ No newline at end of file" || hunkLine === "") {
+        // allowed metadata/blank
+      } else {
+        return { ok: false, reason: `Unexpected line inside hunk: '${hunkLine}'.` };
+      }
+      i += 1;
+    }
+
+    if (seenOld !== expectedOld || seenNew !== expectedNew) {
+      return {
+        ok: false,
+        reason: `Hunk line count mismatch (expected -${expectedOld}/+${expectedNew}, got -${seenOld}/+${seenNew}).`,
+      };
+    }
+  }
+
+  return { ok: true };
 }
 
 export async function proposeFix(input: {
@@ -898,121 +963,189 @@ export async function proposeFix(input: {
     serializedLogs,
   ].join("\n");
 
-  const requestBody = useResponsesApi
-    ? {
-        model,
-        input: [
-          {
-            role: "system",
-            content: [{ type: "input_text", text: systemPrompt }],
-          },
-          {
-            role: "user",
-            content: [{ type: "input_text", text: prompt }],
-          },
-        ],
-        max_output_tokens: LLM_MAX_OUTPUT_TOKENS,
-      }
-    : {
-        model,
-        max_tokens: LLM_MAX_OUTPUT_TOKENS,
-        response_format: { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt,
-          },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-      };
-
-  const startedAt = Date.now();
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(requestBody),
-  });
-
-  const durationMs = Date.now() - startedAt;
   const trace: TraceEvent[] = [];
+  let lastFailure = "";
+  let lastRawOutput = "";
 
-  const payload = await parseJsonOrTextBody(response);
+  for (let attempt = 1; attempt <= MAX_PROPOSE_ATTEMPTS; attempt += 1) {
+    const attemptPrompt =
+      attempt === 1
+        ? prompt
+        : [
+            prompt,
+            "",
+            "The previous patch was invalid.",
+            `Failure reason: ${lastFailure || "Invalid patch format"}`,
+            "Return a complete corrected unified diff. Do not truncate output.",
+          ].join("\n");
 
-  if (!response.ok) {
-    const openAiError = serializeOpenAiError(payload);
-    if (debugLlm) {
-      console.error("OpenAI propose-fix error payload:", payload);
+    const requestBody = useResponsesApi
+      ? {
+          model,
+          input: [
+            {
+              role: "system",
+              content: [{ type: "input_text", text: systemPrompt }],
+            },
+            {
+              role: "user",
+              content: [{ type: "input_text", text: attemptPrompt }],
+            },
+          ],
+          max_output_tokens: LLM_MAX_OUTPUT_TOKENS,
+        }
+      : {
+          model,
+          max_tokens: LLM_MAX_OUTPUT_TOKENS,
+          response_format: { type: "json_object" },
+          messages: [
+            {
+              role: "system",
+              content: systemPrompt,
+            },
+            {
+              role: "user",
+              content: attemptPrompt,
+            },
+          ],
+        };
+
+    const startedAt = Date.now();
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+    });
+    const durationMs = Date.now() - startedAt;
+    const payload = await parseJsonOrTextBody(response);
+
+    if (!response.ok) {
+      const openAiError = serializeOpenAiError(payload);
+      if (debugLlm) {
+        console.error("OpenAI propose-fix error payload:", payload);
+      }
+
+      trace.push({
+        ts: nowIso(),
+        step: `propose-fix-attempt-${attempt}`,
+        tool: toolName,
+        inputSummary: `model=${model}`,
+        exitCode: 1,
+        stdoutSnippet: "",
+        stderrSnippet: truncate(openAiError, TRACE_SNIPPET_CHARS),
+        durationMs,
+      });
+
+      throw new MiniCiServiceError(
+        `OpenAI request failed (${response.status} ${response.statusText}): ${openAiError}`,
+        502,
+      );
     }
+
+    const modelText = useResponsesApi ? extractResponsesText(payload) : extractChatCompletionsText(payload);
+    if (!modelText) {
+      const serializedPayload = serializeOpenAiError(payload);
+      trace.push({
+        ts: nowIso(),
+        step: `propose-fix-attempt-${attempt}`,
+        tool: toolName,
+        inputSummary: `model=${model}`,
+        exitCode: 1,
+        stdoutSnippet: "",
+        stderrSnippet: truncate("LLM returned empty content.", TRACE_SNIPPET_CHARS),
+        durationMs,
+      });
+
+      throw new MiniCiServiceError(
+        `LLM returned empty content. Response payload: ${serializedPayload}`,
+        502,
+      );
+    }
+
+    lastRawOutput = modelText;
+
+    let parsed: { explanation?: string; diff?: string };
+    try {
+      parsed = parseProposalContent(modelText);
+    } catch (error) {
+      const message = toErrorMessage(error);
+      trace.push({
+        ts: nowIso(),
+        step: `propose-fix-attempt-${attempt}`,
+        tool: toolName,
+        inputSummary: `model=${model}`,
+        exitCode: 1,
+        stdoutSnippet: "",
+        stderrSnippet: truncate(message, TRACE_SNIPPET_CHARS),
+        durationMs,
+      });
+
+      if (attempt < MAX_PROPOSE_ATTEMPTS) {
+        lastFailure = `Model output was not parseable JSON: ${message}`;
+        continue;
+      }
+
+      throw error;
+    }
+
+    const explanation = parsed.explanation?.trim() || "No explanation was returned.";
+    const rawDiff = parsed.diff?.trim() || "";
+    const diff = normalizeDiffPatch(rawDiff);
+    const validation = validateUnifiedDiff(diff);
 
     trace.push({
       ts: nowIso(),
-      step: "propose-fix",
+      step: `propose-fix-attempt-${attempt}`,
       tool: toolName,
       inputSummary: `model=${model}`,
-      exitCode: 1,
-      stdoutSnippet: "",
-      stderrSnippet: truncate(openAiError, TRACE_SNIPPET_CHARS),
+      exitCode: validation.ok && Boolean(diff) ? 0 : 1,
+      stdoutSnippet: truncate(diff, TRACE_SNIPPET_CHARS),
+      stderrSnippet: validation.ok ? "" : truncate(validation.reason || "No diff produced.", TRACE_SNIPPET_CHARS),
       durationMs,
     });
 
-    throw new MiniCiServiceError(
-      `OpenAI request failed (${response.status} ${response.statusText}): ${openAiError}`,
-      502,
-    );
+    if (!diff) {
+      lastFailure = "LLM did not return a diff proposal.";
+      if (attempt < MAX_PROPOSE_ATTEMPTS) {
+        continue;
+      }
+      throw new MiniCiServiceError(lastFailure, 502);
+    }
+
+    if (diff.length > MAX_DIFF_CHARS) {
+      lastFailure = `LLM diff exceeded maximum size (${MAX_DIFF_CHARS} chars).`;
+      if (attempt < MAX_PROPOSE_ATTEMPTS) {
+        continue;
+      }
+      throw new MiniCiServiceError(lastFailure, 502);
+    }
+
+    if (!validation.ok) {
+      lastFailure = validation.reason || "LLM returned an invalid unified patch.";
+      if (attempt < MAX_PROPOSE_ATTEMPTS) {
+        continue;
+      }
+      throw new MiniCiServiceError(
+        `LLM returned an invalid unified patch: ${lastFailure}. Raw diff snippet: ${truncate(rawDiff, 1500)}`,
+        502,
+      );
+    }
+
+    return {
+      runId: session.runId,
+      explanation,
+      diff,
+      trace,
+    };
   }
 
-  const modelText = useResponsesApi ? extractResponsesText(payload) : extractChatCompletionsText(payload);
-  if (!modelText) {
-    const serializedPayload = serializeOpenAiError(payload);
-    throw new MiniCiServiceError(
-      `LLM returned empty content. Response payload: ${serializedPayload}`,
-      502,
-    );
-  }
-
-  const parsed = parseProposalJson(modelText);
-  const explanation = parsed.explanation?.trim() || "No explanation was returned.";
-  const rawDiff = parsed.diff?.trim() || "";
-  const diff = normalizeDiffPatch(rawDiff);
-
-  trace.push({
-    ts: nowIso(),
-    step: "propose-fix",
-    tool: toolName,
-    inputSummary: `model=${model}`,
-    exitCode: diff ? 0 : 1,
-    stdoutSnippet: truncate(diff, TRACE_SNIPPET_CHARS),
-    stderrSnippet: diff ? "" : "No diff produced.",
-    durationMs,
-  });
-
-  if (!diff) {
-    throw new MiniCiServiceError("LLM did not return a diff proposal.", 502);
-  }
-
-  if (!hasUnifiedDiffStructure(diff)) {
-    throw new MiniCiServiceError(
-      `LLM did not return a valid unified patch. Raw diff snippet: ${truncate(rawDiff, 1500)}`,
-      502,
-    );
-  }
-
-  if (diff.length > MAX_DIFF_CHARS) {
-    throw new MiniCiServiceError(`LLM diff exceeded maximum size (${MAX_DIFF_CHARS} chars).`, 502);
-  }
-
-  return {
-    runId: session.runId,
-    explanation,
-    diff,
-    trace,
-  };
+  throw new MiniCiServiceError(
+    `Unable to generate a valid patch after ${MAX_PROPOSE_ATTEMPTS} attempts. Raw output: ${truncate(lastRawOutput, 1500)}`,
+    502,
+  );
 }
 
 export async function applyFix(input: {
@@ -1030,9 +1163,10 @@ export async function applyFix(input: {
     throw new Error(`Diff too large (>${MAX_DIFF_CHARS} chars).`);
   }
 
-  if (!hasUnifiedDiffStructure(normalizedDiff)) {
+  const validation = validateUnifiedDiff(normalizedDiff);
+  if (!validation.ok) {
     throw new MiniCiServiceError(
-      "Proposed diff is not a valid unified patch. Please generate a new fix proposal.",
+      `Proposed diff is not a valid unified patch (${validation.reason}). Please generate a new fix proposal.`,
       400,
     );
   }
