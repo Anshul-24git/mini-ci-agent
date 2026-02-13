@@ -790,7 +790,52 @@ function normalizeDiffPatch(rawDiff: string): string {
     text = text.slice(marker.index).trim();
   }
 
-  return text;
+  const lines = text.split("\n");
+  const cleaned: string[] = [];
+  let inFile = false;
+  let inHunk = false;
+
+  const fileMetaPattern =
+    /^(index |new file mode |deleted file mode |old mode |new mode |similarity index |rename from |rename to |--- |\+\+\+ |Binary files )/;
+
+  for (const line of lines) {
+    if (line.startsWith("diff --git ")) {
+      inFile = true;
+      inHunk = false;
+      cleaned.push(line);
+      continue;
+    }
+
+    if (!inFile) {
+      continue;
+    }
+
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      cleaned.push(line);
+      continue;
+    }
+
+    if (fileMetaPattern.test(line)) {
+      inHunk = false;
+      cleaned.push(line);
+      continue;
+    }
+
+    if (inHunk) {
+      if (
+        line.startsWith("+") ||
+        line.startsWith("-") ||
+        line.startsWith(" ") ||
+        line === "\\ No newline at end of file"
+      ) {
+        cleaned.push(line);
+      }
+      continue;
+    }
+  }
+
+  return cleaned.join("\n").trim();
 }
 
 function hasUnifiedDiffStructure(diff: string): boolean {
